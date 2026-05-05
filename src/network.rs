@@ -96,7 +96,8 @@ pub async fn publish_game(name: &str, file_path: &str) -> Result<(), Box<dyn std
     // IPFS PubSub HTTP API'sinde argümanlar query (URL parametresi) olarak yollanır.
     // Aynı isme ("arg") sahip iki parametre yolluyoruz: 1. Kanal Adı, 2. Mesajın kendisi (Bizim JSON)
     let pub_res = client.post("http://127.0.0.1:5001/api/v0/pubsub/pub")
-        .query(&[("arg", "fairplay-games"), ("arg", &game_json)])
+        .query(&[("arg", "fairplay-games")]) 
+        .body(game_json)
         .send()
         .await?;
 

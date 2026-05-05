@@ -17,12 +17,14 @@ enum Commands {
         /// Oyunun adı
         #[arg(short, long)]
         name: String,
-        /// Oyun dosyası veya dizininin yolu (örn: ./my_game)
+        /// Oyun dosyası veya dizininin yolu
         #[arg(short, long)]
         path: String,
     },
     /// Ağdan duyulan mevcut oyunları listele
     List,
+    /// Ağı sürekli dinleyerek yeni oyunları keşfeder (Kapatana kadar çalışır)
+    Listen, // <--- EKSİK OLAN SATIR BURASIYDI!
     /// Bir oyunu ID ile indir ve izole ortamda (sandbox) çalıştır
     Play {
         /// Oynanacak oyunun kayıt ID'si
@@ -34,28 +36,29 @@ enum Commands {
 async fn main() {
     registry::init();
 
-    tokio::spawn(async move {
-        network::start_listener().await;
-    });
+    // DİKKAT: Buradaki tokio::spawn bloğunu tamamen sildik!
 
     let cli = Cli::parse();
 
-    // Kullanıcının girdiği komutu eşleştirip ilgili fonksiyona yönlendiriyoruz
     match &cli.command {
         Commands::Publish { name, path } => {
-            println!("Yayınlanıyor...\nOyun Adı: {}\nDosya Yolu: {}", name, path);
-            // TODO: Issue #5 (IPFS'e ekle ve PubSub ile anons et)
+            println!("🚀 İşlem başlatıldı: {} (Yol: {})", name, path);
             if let Err(e) = network::publish_game(name, path).await {
                 eprintln!("Yayınlama başarısız oldu: {}", e);
             }
         }
         Commands::List => {
-            println!("Yerel registry'deki oyunlar listeleniyor...");
-            // TODO: Issue #6 (registry.json'u okuyup tablo halinde bas)
+            println!("🔍 Yerel registry'deki oyunlar listeleniyor...");
+            // Issue #6'da buraya veritabanı okuma kodunu yazacağız
+        }
+        // YENİ EKLENEN KISIM:
+        Commands::Listen => {
+            println!("👂 P2P Ağı dinleniyor... (Çıkmak için Ctrl+C'ye basın)");
+            // await kullandığımız için program burada asılı kalır ve kapanmaz
+            network::start_listener().await; 
         }
         Commands::Play { id } => {
-            println!("Oyun başlatılıyor (ID: {})...", id);
-            // TODO: Issue #7 ve #9 (IPFS'ten indir ve bwrap ile çalıştır)
+            println!("🎮 Oyun başlatılıyor (ID: {})...", id);
         }
     }
 }
