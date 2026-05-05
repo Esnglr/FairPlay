@@ -18,64 +18,76 @@ struct IpfsAddResponse {
 }
 
 pub async fn start_listener() {
+    println!("👂 IPFS Pubsub arka planda dinleniyor...");
+
     let client = reqwest::Client::new();
-    let url = "http://127.0.0.1:5001/api/v0/pubsub/sub?arg=fairplay-games";
-
+    let url = "http://127.0.0.1:5001/api/v0/pubsub/sub?arg=uZmFpcnBsYXktZ2FtZXM";
     loop {
-        let res = client.post(url).send().await;
-        match res {
+        println!("🔄 [SİSTEM] IPFS API'sine bağlanılıyor...");
+        match client.post(url).send().await {
             Ok(mut response) => {
-                let mut buffer = String::new(); // Parçalı chunk'ları toplamak için
+                println!("✅ [SİSTEM] Kanal açıldı. Frekans dinleniyor...");
+                let mut buffer: Vec<u8> = Vec::new();
 
+                // Ağdan veri aktığı anda burası tetiklenir
                 while let Ok(Some(chunk)) = response.chunk().await {
-                    if let Ok(text) = String::from_utf8(chunk.to_vec()) {
-                        buffer.push_str(&text);
+                    println!("📥 [RÖNTGEN] Ağdan {} byte veri aktı!", chunk.len());
+                    buffer.extend_from_slice(&chunk);
 
-                        // Tam bir satır (\n) gelene kadar döngüde kal
-                        while let Some(pos) = buffer.find('\n') {
-                            let line = buffer[..pos].trim().to_string();
-                            buffer = buffer[pos + 1..].to_string(); // İşlenen kısmı at
+                    while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                        let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+                        let line_str = String::from_utf8_lossy(&line_bytes);
+                        let line = line_str.trim();
 
-                            if line.is_empty() { continue; }
+                        if line.is_empty() {
+                            continue;
+                        }
 
-                            // Debug: Gelen ham satırı gör
-                            // println!("DEBUG - Gelen Ham Satır: {}", line);
+                        println!("🔍 [RÖNTGEN] Ham veri yakalandı: {}", line);
 
-                            match serde_json::from_str::<IpfsZarf>(&line) {
-                                Ok(zarf) => {
-                                    if let Some(base64_data) = zarf.data {
-                                        process_incoming_data(base64_data).await;
+                        // JSON çözümleme adımları ve özel hata mesajları
+                        match serde_json::from_str::<IpfsZarf>(line) {
+                            Ok(zarf) => {
+                                if let Some(base64_data) = zarf.data {
+                                    
+                                    let clean_base64 = if base64_data.starts_with('u') {
+                                        &base64_data[1..] // Baştaki 'u' harfini at
                                     } else {
-                                        eprintln!("⚠️ Zarf geldi ama 'data' alanı boş!");
+                                        &base64_data
+                                    };
+
+                                    // Temizlenmiş veriyle decode işlemini yap
+                                    let decode_result = general_purpose::URL_SAFE.decode(clean_base64)
+                                        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(clean_base64))
+                                        .or_else(|_| general_purpose::STANDARD.decode(clean_base64));
+                                    
+                                    match decode_result {
+                                        Ok(decoded_bytes) => {
+                                            match serde_json::from_slice::<crate::registry::Game>(&decoded_bytes) {
+                                                Ok(oyun) => {
+                                                    println!("\n🎉 [BAŞARI] AĞDA YENİ OYUN BULUNDU: {} (CID: {})", oyun.name, oyun.cid);
+                                                    crate::registry::save_game(oyun);
+                                                }
+                                                Err(e) => eprintln!("⚠️ [HATA] Oyun formatı bozuk: {} (Gelen: {:?})", e, String::from_utf8_lossy(&decoded_bytes)),
+                                            }
+                                        }
+                                        Err(e) => eprintln!("⚠️ [HATA] Base64 çözülemedi: {}", e),
                                     }
+                                } else {
+                                     println!("⚠️ [HATA] Zarf geldi ama içi boş (data alanı yok).");
                                 }
-                                Err(e) => eprintln!("❌ Parse Hatası (JSON tam gelmemiş olabilir): {}", e),
                             }
+                            Err(e) => eprintln!("⚠️ [HATA] PubSub Zarfı okunamadı: {}", e),
                         }
                     }
                 }
+                println!("⚠️ [SİSTEM] IPFS API bağlantıyı kopardı, 2 saniye sonra tekrar denenecek...");
             }
-            Err(e) => eprintln!("Bağlantı hatası: {}. 2sn içinde tekrar denenecek...", e),
+            Err(e) => {
+                eprintln!("❌ [HATA] IPFS API'sine ulaşılamadı. Hata: {}", e);
+            }
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    }
-}
-
-// Yardımcı fonksiyon: Decode ve Kayıt
-async fn process_incoming_data(base64_data: String) {
-    // IPFS bazen standart bazen URL_SAFE base64 gönderir
-    let decoded = general_purpose::STANDARD.decode(&base64_data)
-        .or_else(|_| general_purpose::URL_SAFE.decode(&base64_data))
-        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(&base64_data));
-
-    match decoded {
-        Ok(bytes) => {
-            if let Ok(oyun) = serde_json::from_slice::<registry::Game>(&bytes) {
-                println!("\n🎉 [P2P] Yeni oyun: {} (CID: {})", oyun.name, oyun.cid);
-                registry::save_game(oyun); // registry.json'a kaydet[cite: 3]
-            }
-        }
-        Err(e) => eprintln!("❌ Decode başarısız: {}", e),
     }
 }
 
