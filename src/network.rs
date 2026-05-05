@@ -18,38 +18,64 @@ struct IpfsAddResponse {
 }
 
 pub async fn start_listener() {
-    println!("IPFS Pubsub is started at the background");
-
     let client = reqwest::Client::new();
-    let url="http://127.0.0.1:5001/api/v0/pubsub/sub?arg=fairplay-games";
+    let url = "http://127.0.0.1:5001/api/v0/pubsub/sub?arg=fairplay-games";
 
-    loop{
-        match client.get(url).send().await {
+    loop {
+        let res = client.post(url).send().await;
+        match res {
             Ok(mut response) => {
+                let mut buffer = String::new(); // Parçalı chunk'ları toplamak için
+
                 while let Ok(Some(chunk)) = response.chunk().await {
-                    if let Ok(text) = String::from_utf8(chunk.to_vec()){
-                        for line in text.lines(){
-                            if line.trim().is_empty(){
-                                continue;
-                            }
-                            if let Ok(zarf) = serde_json::from_str::<IpfsZarf>(line){
-                                if let Some(base64_data) = zarf.data{
-                                    if let Ok(decoded_bytes)= general_purpose::STANDARD.decode(base64_data){
-                                        if let Ok(oyun) = serde_json::from_slice::<registry::Game>(&decoded_bytes) {
-                                            println!("\n🎉 [P2P] Ağda yeni oyun anons edildi: {} (CID: {})", oyun.name, oyun.cid);
-                                            // Veritabanına (JSON dosyasına) kaydet
-                                            registry::save_game(oyun);
-                                        }     
+                    if let Ok(text) = String::from_utf8(chunk.to_vec()) {
+                        buffer.push_str(&text);
+
+                        // Tam bir satır (\n) gelene kadar döngüde kal
+                        while let Some(pos) = buffer.find('\n') {
+                            let line = buffer[..pos].trim().to_string();
+                            buffer = buffer[pos + 1..].to_string(); // İşlenen kısmı at
+
+                            if line.is_empty() { continue; }
+
+                            // Debug: Gelen ham satırı gör
+                            // println!("DEBUG - Gelen Ham Satır: {}", line);
+
+                            match serde_json::from_str::<IpfsZarf>(&line) {
+                                Ok(zarf) => {
+                                    if let Some(base64_data) = zarf.data {
+                                        process_incoming_data(base64_data).await;
+                                    } else {
+                                        eprintln!("⚠️ Zarf geldi ama 'data' alanı boş!");
                                     }
                                 }
+                                Err(e) => eprintln!("❌ Parse Hatası (JSON tam gelmemiş olabilir): {}", e),
                             }
                         }
                     }
                 }
             }
-            Err(_) => {}
+            Err(e) => eprintln!("Bağlantı hatası: {}. 2sn içinde tekrar denenecek...", e),
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    }
+}
+
+// Yardımcı fonksiyon: Decode ve Kayıt
+async fn process_incoming_data(base64_data: String) {
+    // IPFS bazen standart bazen URL_SAFE base64 gönderir
+    let decoded = general_purpose::STANDARD.decode(&base64_data)
+        .or_else(|_| general_purpose::URL_SAFE.decode(&base64_data))
+        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(&base64_data));
+
+    match decoded {
+        Ok(bytes) => {
+            if let Ok(oyun) = serde_json::from_slice::<registry::Game>(&bytes) {
+                println!("\n🎉 [P2P] Yeni oyun: {} (CID: {})", oyun.name, oyun.cid);
+                registry::save_game(oyun); // registry.json'a kaydet[cite: 3]
+            }
+        }
+        Err(e) => eprintln!("❌ Decode başarısız: {}", e),
     }
 }
 
