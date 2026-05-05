@@ -96,66 +96,48 @@ pub async fn start_listener(topic: &str) {
 }
 
 // Oyun yayınlama fonksiyonu
-pub async fn publish_game(name: &str, file_path: &str, channel: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
+pub async fn publish_game(name: &str, file_path: &str, channel: &str, executable: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    println!("📦 Klasör/Dosya IPFS ağına yükleniyor...");
 
-    // ADIM 1: Dosyayı oku ve Multipart Form oluştur (Task 5.1)
-    let mut file = File::open(file_path).expect("Dosya bulunamadı! (Lütfen tam yolu girin)");
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
+    // ADIM 1 & 2: IPFS CLI kullanarak Klasör/Dosya Ekleme (Recursive)
+    use std::process::{Command, Stdio};
+    use std::io::Write;
+    
+    let add_output = Command::new("ipfs")
+        .arg("add")
+        .arg("-r") // Klasörleri içindeki her şeyle birlikte ekle (recursive)
+        .arg("-Q") // Çıktıyı sessize al, SADECE en üst klasörün CID'sini (Hash) ver (Quiet)
+        .arg(file_path)
+        .output()?;
 
-    // Dosyayı form verisi olarak paketle
-    let part = reqwest::multipart::Part::bytes(buffer).file_name(file_path.to_string());
-    let form = reqwest::multipart::Form::new().part("file", part);
-
-    println!("📦 Dosya IPFS ağına yükleniyor...");
-    let add_res = client.post("http://127.0.0.1:5001/api/v0/add")
-        .multipart(form)
-        .send()
-        .await?;
-
-    // ADIM 2: Dönen JSON'dan Hash (CID) değerini ayıkla (Task 5.2)
-    let add_text = add_res.text().await?;
-    let mut cid = String::new();
-
-    // Yanıtı satır satır parçala ve içindeki Hash'i bul
-    for line in add_text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        // Sadece "Hash" alanı olan geçerli satırları (IpfsAddResponse) yakala
-        if let Ok(ipfs_data) = serde_json::from_str::<IpfsAddResponse>(line) {
-            cid = ipfs_data.hash;
-        }
+    if !add_output.status.success() {
+        let err_text = String::from_utf8_lossy(&add_output.stderr);
+        return Err(format!("IPFS Ekleme Hatası: {}", err_text).into());
     }
 
-    if cid.is_empty() {
-        return Err(format!("IPFS yanıtından CID çıkarılamadı. Ham yanıt: {}", add_text).into());
-    }
+    // IPFS bize doğrudan ve tertemiz bir şekilde CID döndürüyor
+    let cid = String::from_utf8_lossy(&add_output.stdout).trim().to_string();
+    println!("✅ Dosyalar başarıyla eklendi! Root CID: {}", cid);
 
-    println!("✅ Dosya başarıyla eklendi! CID: {}", cid);
-
-    // ADIM 3: Oyun objesini (JSON) oluştur (Task 5.3)
+    // ADIM 3: Oyun objesini (JSON) oluştur
     let game = crate::registry::Game {
         id: cid.clone(), // Benzersiz ID olarak oyunun kendi Hash'ini kullanıyoruz
         name: name.to_string(),
         cid: cid.clone(),
-        timestamp: Utc::now(),
+        timestamp: chrono::Utc::now(),
+        executable, // Başlatma argümanı JSON'a ekleniyor
     };
     
     // Objemizi ağa yollamak üzere String'e çeviriyoruz
     let game_json = serde_json::to_string(&game)?;
 
-    // ADIM 4: PubSub üzerinden ağa duyur (Task 5.4) - SHELL (CLI) HACK
+    // ADIM 4: PubSub üzerinden ağa duyur
     println!("📢 Oyun '{}' kanalındaki Peer'lara duyuruluyor...", channel);
-
-    use std::process::{Command, Stdio};
-    use std::io::Write;
 
     let mut child = Command::new("ipfs")
         .arg("pubsub")
         .arg("pub")
-        .arg(channel) // <--- ARTIK HARDCODED DEĞİL, DİNAMİK PARAMETRE KULLANIYORUZ
+        .arg(channel) // ARTIK HARDCODED DEĞİL, DİNAMİK PARAMETRE KULLANIYORUZ
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

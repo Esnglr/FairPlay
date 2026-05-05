@@ -10,6 +10,7 @@ pub struct Game {
 	pub name: String,
 	pub cid: String,
 	pub timestamp: DateTime<Utc>,
+        pub executable: Option<String>,
 }
 
 fn get_registry_path() -> PathBuf {

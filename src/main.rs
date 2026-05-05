@@ -23,6 +23,8 @@ enum Commands {
         path: String,
         #[arg(short, long, default_value = "fairplay-games")]
         channel: String,
+        #[arg(short, long)]
+        executable: Option<String>,
     },
     /// Ağdan duyulan mevcut oyunları listele
     List,
@@ -47,10 +49,10 @@ async fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Publish { name, path, channel } => {
+        Commands::Publish { name, path, channel, executable } => {
             println!("🚀 İşlem başlatıldı: {} (Yol: {}, Kanal: {})", name, path, channel);
             // channel parametresini fonksiyona iletiyoruz
-            if let Err(e) = network::publish_game(name, path, channel).await {
+            if let Err(e) = network::publish_game(name, path, channel, executable.clone()).await {
                 eprintln!("Yayınlama başarısız oldu: {}", e);
             }
         }
@@ -107,12 +109,72 @@ async fn main() {
             println!("Ozel kanala kilitleniyor: {}", channel);
             network::start_listener(channel).await;}
         Commands::Play { id } => {
-            println!("🎮 Oyun hazırlıkları başlatılıyor (ID: {})...", id);
+            let mut games = crate::registry::load_games();
+            let game = games.into_iter().find(|g| g.id == *id).expect("❌ Oyun kayıtlı değil! Önce listelemeniz gerekebilir.");
+
+            println!("🎮 '{}' için hazırlıklar başlatılıyor...", game.name);
             
-            match network::fetch_game(id).await {
+            match crate::network::fetch_game(id).await {
                 Ok(cache_path) => {
-                    println!("🚀 Görev 7 Tamamlandı! Oyun klasörü: {:?}", cache_path);
-                    // İlerleyen Task 9 (Sandbox/Çalıştırma) burada bu cache_path'i kullanacak.
+                    println!("🚀 Oyun dosyaları hazır: {:?}", cache_path);
+                    
+                    if let Some(exec_path) = game.executable {
+                        // 1. Akıllı Dosya Bulucu (Smart Path Resolver)
+                        let mut full_exec_path = cache_path.join(&exec_path);
+
+                        // Verilen yol doğrudan çalışmıyorsa IPFS hiyerarşisinde dosyayı ara
+                        if !full_exec_path.exists() {
+                            let file_name = std::path::Path::new(&exec_path).file_name().unwrap();
+                            
+                            // İhtimal 1: IPFS arşivi her şeyi CID isimli bir klasöre koyar (cache/CID/CID/dwarfort)
+                            let alt_path_1 = cache_path.join(id).join(file_name);
+                            // İhtimal 2: Direkt cache klasörünün altına inmiştir (cache/CID/dwarfort)
+                            let alt_path_2 = cache_path.join(file_name);
+
+                            if alt_path_1.exists() {
+                                full_exec_path = alt_path_1;
+                            } else if alt_path_2.exists() {
+                                full_exec_path = alt_path_2;
+                            }
+                        }
+
+                        // Hala bulunamadıysa uyarı ver
+                        if !full_exec_path.exists() {
+                            eprintln!("❌ İndirme başarılı ancak '{}' çalıştırılabilir dosyası bulunamadı!", exec_path);
+                            return;
+                        }
+
+                        println!("⚙️ Oyun motoru ateşleniyor: {:?}", full_exec_path);
+                        
+                        // 2. OYUNUN KENDİ KLASÖRÜNÜ ÇALIŞMA DİZİNİ YAP (Oyunun çökmemesi için hayati)
+                        let work_dir = full_exec_path.parent().unwrap();
+
+                        // UNIX İzinleri
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            if let Ok(metadata) = std::fs::metadata(&full_exec_path) {
+                                let mut perms = metadata.permissions();
+                                perms.set_mode(0o755); // Çalıştırma izni ver (rwxr-xr-x)
+                                let _ = std::fs::set_permissions(&full_exec_path, perms);
+                            }
+                        }
+
+                        // Oyunu Başlat
+                        println!("==================================================");
+                        let mut child = std::process::Command::new(&full_exec_path)
+                            .current_dir(work_dir) // <--- OYUNUN YANINDAKİ KLASÖRLERİ GÖREBİLMESİ İÇİN
+                            .spawn()
+                            .expect("❌ Oyun başlatılamadı! Dosya bozuk veya uyumsuz olabilir.");
+                        
+                        let status = child.wait().expect("Oyun süreci dinlenirken hata oluştu");
+                        println!("==================================================");
+                        println!("🏁 Oyun kapandı (Çıkış Kodu: {})", status);
+
+                    } else {
+                        println!("⚠️ Bu oyun için otomatik başlatma verisi (executable) tanımlanmamış.");
+                        println!("📂 Dosyalara şu dizinden ulaşabilirsiniz: {:?}", cache_path);
+                    }
                 }
                 Err(e) => {
                     eprintln!("❌ Oyunu indirirken bir hata oluştu: {}", e);
