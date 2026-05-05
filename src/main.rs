@@ -48,8 +48,33 @@ async fn main() {
             }
         }
         Commands::List => {
-            println!("🔍 Yerel registry'deki oyunlar listeleniyor...");
-            // Issue #6'da buraya veritabanı okuma kodunu yazacağız
+            println!("🔍 Yerel registry'deki oyunlar listeleniyor...\n");
+            
+            // Veritabanından oyunları çekiyoruz
+            let mut games = registry::load_games();
+
+            if games.is_empty() {
+                println!("⚠️ Henüz keşfedilmiş bir oyun yok. 'listen' komutuyla ağı dinlemeye başlayın!");
+            } else {
+                // Algoritmasız, saf kronolojik sıralama (En yeni en üstte)
+                games.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+                // Tablo başlıkları
+                println!("{:<5} {:<25} {:<50} {:<20}", "NO", "İSİM", "CID (ADRES)", "TARİH");
+                println!("{}", "-".repeat(105));
+
+                for (idx, game) in games.iter().enumerate() {
+                    let date_str = game.timestamp.format("%Y-%m-%d %H:%M").to_string();
+                    
+                    println!("{:<5} {:<25} {:<50} {:<20}", 
+                        idx + 1, 
+                        game.name, 
+                        game.cid, 
+                        date_str
+                    );
+                }
+                println!("\n💡 Oynamak için: cargo run -- play <CID>");
+            }
         }
         // YENİ EKLENEN KISIM:
         Commands::Listen => {
