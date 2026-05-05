@@ -90,23 +90,38 @@ pub async fn publish_game(name: &str, file_path: &str) -> Result<(), Box<dyn std
     // Objemizi ağa yollamak üzere String'e çeviriyoruz
     let game_json = serde_json::to_string(&game)?;
 
-    // ADIM 4: PubSub üzerinden ağa duyur (Task 5.4)
+    // ADIM 4: PubSub üzerinden ağa duyur (Task 5.4) - SHELL (CLI) HACK
     println!("📢 Oyun ağdaki diğer Peer'lara (Gossip) duyuruluyor...");
-    
-    // IPFS PubSub HTTP API'sinde argümanlar query (URL parametresi) olarak yollanır.
-    // Aynı isme ("arg") sahip iki parametre yolluyoruz: 1. Kanal Adı, 2. Mesajın kendisi (Bizim JSON)
-    let pub_res = client.post("http://127.0.0.1:5001/api/v0/pubsub/pub")
-        .query(&[("arg", "fairplay-games")]) 
-        .body(game_json)
-        .send()
-        .await?;
 
-    if pub_res.status().is_success() {
+    use std::process::{Command, Stdio};
+    use std::io::Write;
+
+    // IPFS sürecini (process) başlatıyoruz ama çalıştırmayı bekletip STDIN borusu açıyoruz
+    let mut child = Command::new("ipfs")
+        .arg("pubsub")
+        .arg("pub")
+        .arg("fairplay-games")
+        .stdin(Stdio::piped())  // Veriyi buradan akıtacağız
+        .stdout(Stdio::piped()) // Çıktıları yakalamak için
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("IPFS CLI komutu başlatılamadı (ipfs PATH'te mi?)");
+
+    // Açtığımız borunun (stdin) içine JSON byte'larımızı yazıyoruz
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(game_json.as_bytes()).expect("JSON verisi STDIN'e yazılamadı");
+    }
+
+    // Şimdi sürecin bitmesini bekle ve dönen sonucu al
+    let output = child.wait_with_output().expect("IPFS CLI süreci beklenemedi");
+
+    if output.status.success() {
         println!("🎉 '{}' isimli oyun başarıyla ağa yayınlandı!", name);
-        // Duyurduğumuz oyunu kendi yerel listemize de (registry) ekleyelim ki biz de görebilelim
+        // Yerel registry'ye (JSON veritabanımıza) kaydet
         crate::registry::save_game(game);
     } else {
-        println!("❌ Ağa duyururken bir hata oluştu. HTTP Status: {}", pub_res.status());
+        let err_text = String::from_utf8_lossy(&output.stderr);
+        eprintln!("❌ Ağa duyururken CLI hatası oluştu: {}", err_text);
     }
 
     Ok(())
