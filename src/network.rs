@@ -7,7 +7,7 @@ use chrono::Utc;
 use std::fs;
 use std::path::PathBuf;
 use std::io::Cursor;
-use tar::Archive;
+use indicatif::{ProgressBar, ProgressStyle};
 
 #[derive(Deserialize)]
 struct IpfsZarf {
@@ -206,24 +206,51 @@ pub async fn fetch_game(id: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
     let url = format!("http://127.0.0.1:5001/api/v0/get?arg={}", cid);
     
     // IPFS RPC uç noktaları HTTP GET kabul etse de resmi standart POST kullanmaktır.
+// ... (üst kısımlar aynı)
     let response = client.post(&url).send().await?;
     
     if !response.status().is_success() {
         return Err(format!("IPFS indirme hatası: Çıktı kodu {}", response.status()).into());
     }
 
-    // İnen dosya byte'larını RAM'e al
-    let bytes = response.bytes().await?;
+    // Task 8.2 & 8.3: İndirme işlemi için Progress Bar ayarları
+    let total_size = response.content_length();
+    let pb = match total_size {
+        Some(size) => ProgressBar::new(size), // Boyut biliniyorsa çubuk yap
+        None => ProgressBar::new_spinner(),   // Bilinmiyorsa animasyonlu sayaç yap
+    };
 
-    // Task 7.4: tar crate'ini kullanarak inen .tar dosyasını cache dizinine çıkart (extract)
+    let style = if total_size.is_some() {
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+            .unwrap()
+            .progress_chars("#>-")
+    } else {
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} [{elapsed_precise}] 📥 İndirilen Veri: {bytes} ({bytes_per_sec})")
+            .unwrap()
+    };
+    pb.set_style(style);
+
+    // Veriyi tek seferde RAM'e gömmek yerine, Chunk (parça parça) okuyan Stream döngüsü
+    let mut bytes = Vec::new();
+    let mut mut_response = response;
+
+    while let Some(chunk) = mut_response.chunk().await? {
+        pb.inc(chunk.len() as u64);       // 1. Progress Bar'ı gelen parça boyutu kadar ilerlet
+        bytes.extend_from_slice(&chunk);  // 2. Parçayı ana buffer'a ekle
+    }
+    pb.finish_with_message("✅ İndirme tamamlandı!");
+
+    // Task 7.4 (Aynı kaldı): İnen dosya byte'larını aç
     println!("📦 Arşiv çıkartılıyor (Extract) -> {:?}", cache_dir);
-    fs::create_dir_all(&cache_dir)?; // Klasörü oluştur
+    fs::create_dir_all(&cache_dir)?;
     
-    let cursor = Cursor::new(bytes); // Byte dizisini okunabilir bir akışa çevir
-    let mut archive = Archive::new(cursor);
-    archive.unpack(&cache_dir)?; // İçeriği cache dizinine fırlat
+    let cursor = Cursor::new(bytes);
+    let mut archive = tar::Archive::new(cursor);
+    archive.unpack(&cache_dir)?;
 
-    println!("✅ Oyun başarıyla indirildi ve diskte hazır!");
+    println!("✅ Oyun başarıyla çıkartıldı ve diskte hazır!");
 
     Ok(cache_dir)
 }
