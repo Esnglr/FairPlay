@@ -4,6 +4,10 @@ use serde::Deserialize;
 use std::fs::File;
 use std::io::Read;
 use chrono::Utc;
+use std::fs;
+use std::path::PathBuf;
+use std::io::Cursor;
+use tar::Archive;
 
 #[derive(Deserialize)]
 struct IpfsZarf {
@@ -112,9 +116,23 @@ pub async fn publish_game(name: &str, file_path: &str, channel: &str) -> Result<
 
     // ADIM 2: Dönen JSON'dan Hash (CID) değerini ayıkla (Task 5.2)
     let add_text = add_res.text().await?;
-    let ipfs_data: IpfsAddResponse = serde_json::from_str(&add_text)
-        .expect("IPFS yanıtı parse edilemedi");
-    let cid = ipfs_data.hash;
+    let mut cid = String::new();
+
+    // Yanıtı satır satır parçala ve içindeki Hash'i bul
+    for line in add_text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Sadece "Hash" alanı olan geçerli satırları (IpfsAddResponse) yakala
+        if let Ok(ipfs_data) = serde_json::from_str::<IpfsAddResponse>(line) {
+            cid = ipfs_data.hash;
+        }
+    }
+
+    if cid.is_empty() {
+        return Err(format!("IPFS yanıtından CID çıkarılamadı. Ham yanıt: {}", add_text).into());
+    }
+
     println!("✅ Dosya başarıyla eklendi! CID: {}", cid);
 
     // ADIM 3: Oyun objesini (JSON) oluştur (Task 5.3)
@@ -162,4 +180,50 @@ pub async fn publish_game(name: &str, file_path: &str, channel: &str) -> Result<
     }
 
     Ok(())
+}
+
+pub async fn fetch_game(id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // Task 7.1: ID'ye karşılık gelen CID'yi registry'den bul
+    let games = crate::registry::load_games();
+    let game = games.iter().find(|g| g.id == id).ok_or("Kayıtlarda bu ID ile oyun bulunamadı!")?;
+    let cid = &game.cid;
+
+    // Task 7.2: Dosyanın ~/.fairplay/cache/<id> dizininde olup olmadığını kontrol et
+    let mut cache_dir = dirs::home_dir().ok_or("HOME dizini bulunamadı")?;
+    cache_dir.push(".fairplay");
+    cache_dir.push("cache");
+    cache_dir.push(id); // Her oyunu kendi ID'si ile klasörleyelim
+
+    if cache_dir.exists() {
+        println!("⚡ Oyun zaten önbellekte (cache) mevcut. İndirme atlanıyor...");
+        return Ok(cache_dir); // Task 9.1'de çalıştırmak üzere bu yolu geri dönüyoruz
+    }
+
+    println!("📥 Oyun IPFS ağından indiriliyor (CID: {})...", cid);
+
+    // Task 7.3: IPFS uç noktasına istek atarak dosyayı (.tar) indir
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:5001/api/v0/get?arg={}", cid);
+    
+    // IPFS RPC uç noktaları HTTP GET kabul etse de resmi standart POST kullanmaktır.
+    let response = client.post(&url).send().await?;
+    
+    if !response.status().is_success() {
+        return Err(format!("IPFS indirme hatası: Çıktı kodu {}", response.status()).into());
+    }
+
+    // İnen dosya byte'larını RAM'e al
+    let bytes = response.bytes().await?;
+
+    // Task 7.4: tar crate'ini kullanarak inen .tar dosyasını cache dizinine çıkart (extract)
+    println!("📦 Arşiv çıkartılıyor (Extract) -> {:?}", cache_dir);
+    fs::create_dir_all(&cache_dir)?; // Klasörü oluştur
+    
+    let cursor = Cursor::new(bytes); // Byte dizisini okunabilir bir akışa çevir
+    let mut archive = Archive::new(cursor);
+    archive.unpack(&cache_dir)?; // İçeriği cache dizinine fırlat
+
+    println!("✅ Oyun başarıyla indirildi ve diskte hazır!");
+
+    Ok(cache_dir)
 }

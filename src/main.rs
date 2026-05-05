@@ -1,6 +1,7 @@
 mod registry;
 mod network;
 use clap::{Parser, Subcommand};
+use cli_table::{format::Justify, Cell, Style, Table};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -56,29 +57,43 @@ async fn main() {
         Commands::List => {
             println!("🔍 Yerel registry'deki oyunlar listeleniyor...\n");
             
-            // Veritabanından oyunları çekiyoruz
+            // Task 6.1: Veritabanından oyunları RAM'e çekiyoruz[cite: 1]
             let mut games = registry::load_games();
 
             if games.is_empty() {
                 println!("⚠️ Henüz keşfedilmiş bir oyun yok. 'listen' komutuyla ağı dinlemeye başlayın!");
             } else {
-                // Algoritmasız, saf kronolojik sıralama (En yeni en üstte)
+                // Task 6.2: Algoritmasız, saf kronolojik sıralama (En yeni en üstte)[cite: 1]
                 games.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
-                // Tablo başlıkları
-                println!("{:<5} {:<25} {:<50} {:<20}", "NO", "İSİM", "CID (ADRES)", "TARİH");
-                println!("{}", "-".repeat(105));
-
+                // Task 6.3: cli-table ile terminalde şık gösterim
+                let mut table_rows = Vec::new();
+                
                 for (idx, game) in games.iter().enumerate() {
                     let date_str = game.timestamp.format("%Y-%m-%d %H:%M").to_string();
                     
-                    println!("{:<5} {:<25} {:<50} {:<20}", 
-                        idx + 1, 
-                        game.name, 
-                        game.cid, 
-                        date_str
-                    );
+                    // Her bir satırı tabloya ekliyoruz
+                    table_rows.push(vec![
+                        (idx + 1).cell().justify(Justify::Right),
+                        game.name.clone().cell(),
+                        game.cid.clone().cell(),
+                        date_str.cell(),
+                    ]);
                 }
+
+                // Tablonun başlıkları ve genel stili
+                let table = table_rows
+                    .table()
+                    .title(vec![
+                        "NO".cell().bold(true),
+                        "İSİM".cell().bold(true),
+                        "CID (ADRES)".cell().bold(true),
+                        "TARİH".cell().bold(true),
+                    ])
+                    .bold(true);
+
+                // Tabloyu ekrana bas
+                println!("{}", table.display().unwrap());
                 println!("\n💡 Oynamak için: cargo run -- play <CID>");
             }
         }
@@ -90,9 +105,19 @@ async fn main() {
         }
         Commands::Connect { channel } => {
             println!("Ozel kanala kilitleniyor: {}", channel);
-            network::start_listener(channel).await;
-        } Commands::Play { id } => {
-            println!("🎮 Oyun başlatılıyor (ID: {})...", id);
+            network::start_listener(channel).await;}
+        Commands::Play { id } => {
+            println!("🎮 Oyun hazırlıkları başlatılıyor (ID: {})...", id);
+            
+            match network::fetch_game(id).await {
+                Ok(cache_path) => {
+                    println!("🚀 Görev 7 Tamamlandı! Oyun klasörü: {:?}", cache_path);
+                    // İlerleyen Task 9 (Sandbox/Çalıştırma) burada bu cache_path'i kullanacak.
+                }
+                Err(e) => {
+                    eprintln!("❌ Oyunu indirirken bir hata oluştu: {}", e);
+                }
+            }
         }
     }
 }
