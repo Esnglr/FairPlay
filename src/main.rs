@@ -20,12 +20,17 @@ enum Commands {
         /// Oyun dosyası veya dizininin yolu
         #[arg(short, long)]
         path: String,
+        #[arg(short, long, default_value = "fairplay-games")]
+        channel: String,
     },
     /// Ağdan duyulan mevcut oyunları listele
     List,
     /// Ağı sürekli dinleyerek yeni oyunları keşfeder (Kapatana kadar çalışır)
     Listen, // <--- EKSİK OLAN SATIR BURASIYDI!
     /// Bir oyunu ID ile indir ve izole ortamda (sandbox) çalıştır
+    Connect {
+        channel: String,
+    },
     Play {
         /// Oynanacak oyunun kayıt ID'si
         id: String,
@@ -41,9 +46,10 @@ async fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Publish { name, path } => {
-            println!("🚀 İşlem başlatıldı: {} (Yol: {})", name, path);
-            if let Err(e) = network::publish_game(name, path).await {
+        Commands::Publish { name, path, channel } => {
+            println!("🚀 İşlem başlatıldı: {} (Yol: {}, Kanal: {})", name, path, channel);
+            // channel parametresini fonksiyona iletiyoruz
+            if let Err(e) = network::publish_game(name, path, channel).await {
                 eprintln!("Yayınlama başarısız oldu: {}", e);
             }
         }
@@ -80,9 +86,12 @@ async fn main() {
         Commands::Listen => {
             println!("👂 P2P Ağı dinleniyor... (Çıkmak için Ctrl+C'ye basın)");
             // await kullandığımız için program burada asılı kalır ve kapanmaz
-            network::start_listener().await; 
+            network::start_listener("fairplay-games").await; 
         }
-        Commands::Play { id } => {
+        Commands::Connect { channel } => {
+            println!("Ozel kanala kilitleniyor: {}", channel);
+            network::start_listener(channel).await;
+        } Commands::Play { id } => {
             println!("🎮 Oyun başlatılıyor (ID: {})...", id);
         }
     }

@@ -1,7 +1,6 @@
 use reqwest;
 use base64::{Engine as _, engine::general_purpose};
 use serde::Deserialize;
-use crate::registry;
 use std::fs::File;
 use std::io::Read;
 use chrono::Utc;
@@ -17,14 +16,15 @@ struct IpfsAddResponse {
     hash: String,
 }
 
-pub async fn start_listener() {
-    println!("👂 IPFS Pubsub arka planda dinleniyor...");
+pub async fn start_listener(topic: &str) {
+    println!("👂 IPFS Pubsub arka planda dinleniyor: {}", topic);
 
     let client = reqwest::Client::new();
-    let url = "http://127.0.0.1:5001/api/v0/pubsub/sub?arg=uZmFpcnBsYXktZ2FtZXM";
+    let encoded_topic = multibase::encode(multibase::Base::Base64Url, topic);
+    let url = format!("http://127.0.0.1:5001/api/v0/pubsub/sub?arg={}", encoded_topic);
     loop {
         println!("🔄 [SİSTEM] IPFS API'sine bağlanılıyor...");
-        match client.post(url).send().await {
+        match client.post(&url).send().await {
             Ok(mut response) => {
                 println!("✅ [SİSTEM] Kanal açıldı. Frekans dinleniyor...");
                 let mut buffer: Vec<u8> = Vec::new();
@@ -92,7 +92,7 @@ pub async fn start_listener() {
 }
 
 // Oyun yayınlama fonksiyonu
-pub async fn publish_game(name: &str, file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn publish_game(name: &str, file_path: &str, channel: &str) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
 
     // ADIM 1: Dosyayı oku ve Multipart Form oluştur (Task 5.1)
@@ -129,21 +129,20 @@ pub async fn publish_game(name: &str, file_path: &str) -> Result<(), Box<dyn std
     let game_json = serde_json::to_string(&game)?;
 
     // ADIM 4: PubSub üzerinden ağa duyur (Task 5.4) - SHELL (CLI) HACK
-    println!("📢 Oyun ağdaki diğer Peer'lara (Gossip) duyuruluyor...");
+    println!("📢 Oyun '{}' kanalındaki Peer'lara duyuruluyor...", channel);
 
     use std::process::{Command, Stdio};
     use std::io::Write;
 
-    // IPFS sürecini (process) başlatıyoruz ama çalıştırmayı bekletip STDIN borusu açıyoruz
     let mut child = Command::new("ipfs")
         .arg("pubsub")
         .arg("pub")
-        .arg("fairplay-games")
-        .stdin(Stdio::piped())  // Veriyi buradan akıtacağız
-        .stdout(Stdio::piped()) // Çıktıları yakalamak için
+        .arg(channel) // <--- ARTIK HARDCODED DEĞİL, DİNAMİK PARAMETRE KULLANIYORUZ
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("IPFS CLI komutu başlatılamadı (ipfs PATH'te mi?)");
+        .expect("IPFS CLI komutu başlatılamadı");
 
     // Açtığımız borunun (stdin) içine JSON byte'larımızı yazıyoruz
     if let Some(mut stdin) = child.stdin.take() {
