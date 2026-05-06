@@ -4,10 +4,177 @@ mod network;
 use eframe::egui;
 use clap::{Parser, Subcommand};
 use cli_table::{format::Justify, Cell, Style, Table};
-use std::path::Path;
 use serde::Deserialize;
 use std::fs;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, UnboundedReceiver};
+use std::path::PathBuf;
 
+// --- STATE VE MESAJLAŞMA ---
+pub enum AppMessage {
+    DownloadProgress { game_id: String, progress: f32 },
+    DownloadComplete { game_id: String, path: PathBuf },
+    GameStarted { game_id: String },
+    GameExited { game_id: String, exit_code: i32 },
+    Error(String),
+}
+
+#[derive(PartialEq)]
+pub enum AppState {
+    Idle,
+    Downloading { game_id: String, progress: f32 },
+    Running { game_id: String },
+}
+
+// --- GÜNCELLENMİŞ GUI KODLARI ---
+struct FairplayApp {
+    games: Vec<crate::registry::Game>,
+    state: AppState,
+    msg_receiver: UnboundedReceiver<AppMessage>,
+    msg_sender: UnboundedSender<AppMessage>,
+}
+
+impl Default for FairplayApp {
+    fn default() -> Self {
+        let (tx, rx) = unbounded_channel();
+        Self {
+            games: crate::registry::load_games(), 
+            state: AppState::Idle,
+            msg_receiver: rx,
+            msg_sender: tx,
+        }
+    }
+}
+
+impl eframe::App for FairplayApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.set_visuals(egui::Visuals::dark());
+        
+        while let Ok(msg) = self.msg_receiver.try_recv() {
+            match msg {
+                AppMessage::DownloadProgress { game_id, progress } => {
+                    self.state = AppState::Downloading { game_id, progress };
+                    ctx.request_repaint(); 
+                }
+                AppMessage::DownloadComplete { game_id: _, path: _ } => {
+                    self.state = AppState::Idle;
+                    ctx.request_repaint();
+                }
+                AppMessage::GameStarted { game_id } => {
+                    self.state = AppState::Running { game_id };
+                    ctx.request_repaint();
+                }
+                AppMessage::GameExited { .. } | AppMessage::Error(_) => {
+                    self.state = AppState::Idle;
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        egui::Panel::top("top_panel").frame(
+            egui::Frame::default().fill(egui::Color32::from_rgb(20, 20, 25)).inner_margin(15.0)
+        ).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading(egui::RichText::new("🎮 FAIRPLAY").size(24.0).color(egui::Color32::from_rgb(0, 255, 100)).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("🔄 Yenile").clicked() {
+                        self.games = crate::registry::load_games();
+                    }
+                });
+            });
+        });
+
+        egui::Panel::bottom("bottom_panel").show(ctx, |ui| {
+            ui.add_space(5.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Fairplay P2P Network - Secure & Censorship Resistant").small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    match &self.state {
+                        AppState::Downloading { .. } => { ui.label("📥 Arka planda indirme yapılıyor..."); },
+                        AppState::Running { .. } => { ui.label("🟢 Oyun çalışıyor..."); },
+                        AppState::Idle => { ui.label("✅ Sistem hazır"); },
+                    }
+                });
+            });
+            ui.add_space(5.0);
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.games.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label(egui::RichText::new("Ağda henüz oyun bulunamadı.\nLütfen terminalden 'listen' komutuyla dinlemeye devam edin...").color(egui::Color32::DARK_GRAY));
+                });
+            } else {
+                egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                    ui.add_space(10.0);
+                    for game in &self.games {
+                        egui::Frame::group(ui.style())
+                            .fill(egui::Color32::from_rgb(30, 30, 35))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(12.0)
+                            .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.heading(egui::RichText::new(&game.name).strong().size(18.0));
+                                    ui.label(egui::RichText::new(format!("Sürüm: v{} | Geliştirici: {}...", game.version, &game.developer_pubkey[..20])).small().color(egui::Color32::GRAY));
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("🛡️");
+                                        ui.label(egui::RichText::new("Doğrulandı (Zero-TOFU)").color(egui::Color32::from_rgb(0, 255, 100)).small());
+                                    });
+                                });
+                                
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    match &self.state {
+                                        AppState::Downloading { game_id, progress } if game_id == &game.id => {
+                                            ui.add(egui::ProgressBar::new(*progress).show_percentage().animate(true).desired_width(150.0));
+                                        },
+                                        AppState::Running { game_id } if game_id == &game.id => {
+                                            ui.add(egui::Spinner::new());
+                                            ui.label(egui::RichText::new("Çalışıyor").color(egui::Color32::LIGHT_GREEN));
+                                        },
+                                        _ => {
+                                            let is_downloaded = crate::registry::is_game_in_cache(&game.id);
+                                            let btn_text = if is_downloaded { "▶ OYNA" } else { "⬇ İNDİR" };
+                                            
+                                            let mut btn = egui::Button::new(egui::RichText::new(btn_text).strong().size(16.0)).min_size(egui::vec2(100.0, 35.0));
+                                            if self.state != AppState::Idle { btn = btn.sense(egui::Sense::hover()); }
+
+                                            if ui.add(btn).clicked() && self.state == AppState::Idle {
+                                                let tx = self.msg_sender.clone();
+                                                let game_clone = game.clone();
+                                                
+                                                tokio::spawn(async move {
+                                                    if !is_downloaded {
+                                                        if let Ok(path) = crate::network::fetch_game(&game_clone.id, Some(tx.clone())).await {
+                                                            let _ = tx.send(AppMessage::DownloadComplete { game_id: game_clone.id.clone(), path });
+                                                        } else {
+                                                            let _ = tx.send(AppMessage::Error("İndirme başarısız".into()));
+                                                        }
+                                                    } else {
+                                                        let _ = tx.send(AppMessage::GameStarted { game_id: game_clone.id.clone() });
+                                                        if let Err(e) = crate::network::launch_game(&game_clone) {
+                                                            let _ = tx.send(AppMessage::Error(e.to_string()));
+                                                        }
+                                                        let _ = tx.send(AppMessage::GameExited { game_id: game_clone.id.clone(), exit_code: 0 });
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
+                                });
+                            });
+                        });
+                        ui.add_space(8.0);
+                    }
+                });
+            }
+        });
+    }
+
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+}
+
+// --- CLI YAPILANDIRMA ---
 #[derive(Deserialize)]
 struct PublishConfig {
     name: String,
@@ -24,7 +191,6 @@ struct PublishConfig {
     cert: String,
 }
 
-// JSON'da channel ve version girilmezse kullanılacak varsayılan değerler
 fn default_channel() -> String { "fairplay-games".to_string() }
 fn default_version() -> u32 { 1 }
 
@@ -78,10 +244,8 @@ async fn main() {
 
             let payload = format!("{}:{}", id, dev_pubkey);
             
-            // DÜZELTME 1: HashAlg::Sha256 eklendi
             let signature = private_key.sign("fairplay-namespace", ssh_key::HashAlg::Sha256, payload.as_bytes()).unwrap();
             
-            // DÜZELTME 2: Base64 çevirisi yerine doğrudan SSH İmza string'ini (PEM) alıyoruz
             let cert_str = signature.to_string(); 
 
             println!("✅ Game developer certificate created!");
@@ -89,17 +253,14 @@ async fn main() {
             println!("Certificate (owned by game developer):\n{}", cert_str);
         }
         Commands::Publish { config_file } => {
-            // 1. JSON dosyasını oku
             let file_content = fs::read_to_string(config_file)
                 .expect("❌ JSON konfigürasyon dosyası okunamadı! Dosya yolunu kontrol edin.");
             
-            // 2. JSON metnini Rust objesine (PublishConfig) çevir
             let config: PublishConfig = serde_json::from_str(&file_content)
                 .expect("❌ JSON dosyası ayrıştırılamadı. Virgülleri veya formatı kontrol edin.");
 
             println!("🚀 Process started: {} (v{})", config.name, config.version);
             
-            // 3. Değerleri mevcut çalışan publish_game fonksiyonuna pasla
             if let Err(e) = network::publish_game(
                 &config.name,
                 &config.path,
@@ -123,10 +284,8 @@ async fn main() {
             if games.is_empty() {
                 println!("⚠️ Henüz keşfedilmiş bir oyun yok. 'listen' komutuyla ağı dinlemeye başlayın!");
             } else {
-                // Algoritmasız, saf kronolojik sıralama (En yeni en üstte)
                 games.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
-                // cli-table ile terminalde şık gösterim
                 let mut table_rows = Vec::new();
                 
                 for (idx, game) in games.iter().enumerate() {
@@ -135,7 +294,7 @@ async fn main() {
                     table_rows.push(vec![
                         (idx + 1).cell().justify(Justify::Right),
                         game.name.clone().cell(),
-                        game.cid.clone().cell(),
+                        game.id.clone().cell(), 
                         date_str.cell(),
                     ]);
                 }
@@ -145,14 +304,13 @@ async fn main() {
                     .title(vec![
                         "NO".cell().bold(true),
                         "İSİM".cell().bold(true),
-                        "CID (ADRES)".cell().bold(true),
+                        "OYUN ID (UUID)".cell().bold(true), 
                         "TARİH".cell().bold(true),
                     ])
                     .bold(true);
 
-                // Tabloyu ekrana bas
                 println!("{}", table.display().unwrap());
-                println!("\n💡 Oynamak için: cargo run -- play <CID>");
+                println!("\n💡 Oynamak için: cargo run -- play <OYUN_ID>"); 
             }
         }
 
@@ -168,77 +326,15 @@ async fn main() {
 
         Commands::Play { id } => {
             let games = crate::registry::load_games();
-            let game = games.into_iter().find(|g| g.id == *id).expect("❌ Oyun kayıtlı değil! Önce listelemeniz gerekebilir.");
-
-            println!("🎮 '{}' için hazırlıklar başlatılıyor...", game.name);
+            let game = games.into_iter().find(|g| g.id == *id).expect("❌ Oyun kayıtlı değil!");
             
-            match crate::network::fetch_game(id).await {
-                Ok(cache_path) => {
-                    println!("🚀 Oyun dosyaları hazır: {:?}", cache_path);
-                    
-                    if let Some(exec_path) = game.executable {
-                        // 1. Akıllı Dosya Bulucu (Smart Path Resolver)
-                        let mut full_exec_path = cache_path.join(&exec_path);
-
-                        // Verilen yol doğrudan çalışmıyorsa IPFS hiyerarşisinde dosyayı ara
-                        if !full_exec_path.exists() {
-                            let file_name = Path::new(&exec_path).file_name().unwrap();
-                            
-                            // İhtimal 1: IPFS arşivi her şeyi CID isimli bir klasöre koyar
-                            let alt_path_1 = cache_path.join(id).join(file_name);
-                            // İhtimal 2: Direkt cache klasörünün altına inmiştir
-                            let alt_path_2 = cache_path.join(file_name);
-
-                            if alt_path_1.exists() {
-                                full_exec_path = alt_path_1;
-                            } else if alt_path_2.exists() {
-                                full_exec_path = alt_path_2;
-                            }
-                        }
-
-                        // Hala bulunamadıysa uyarı ver
-                        if !full_exec_path.exists() {
-                            eprintln!("❌ İndirme başarılı ancak '{}' çalıştırılabilir dosyası bulunamadı!", exec_path);
-                            return;
-                        }
-
-                        println!("⚙️ Oyun motoru ateşleniyor: {:?}", full_exec_path);
-                        
-                        // 2. OYUNUN KENDİ KLASÖRÜNÜ ÇALIŞMA DİZİNİ YAP (Oyunun çökmemesi için hayati)
-                        let work_dir = full_exec_path.parent().unwrap();
-
-                        // UNIX İzinleri
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            if let Ok(metadata) = std::fs::metadata(&full_exec_path) {
-                                let mut perms = metadata.permissions();
-                                perms.set_mode(0o755); // Çalıştırma izni ver (rwxr-xr-x)
-                                let _ = std::fs::set_permissions(&full_exec_path, perms);
-                            }
-                        }
-
-                        // Oyunu Başlat
-                        println!("==================================================");
-                        let mut child = std::process::Command::new(&full_exec_path)
-                            .current_dir(work_dir) // OYUNUN YANINDAKİ KLASÖRLERİ GÖREBİLMESİ İÇİN
-                            .spawn()
-                            .expect("❌ Oyun başlatılamadı! Dosya bozuk veya uyumsuz olabilir.");
-                        
-                        let status = child.wait().expect("Oyun süreci dinlenirken hata oluştu");
-                        println!("==================================================");
-                        println!("🏁 Oyun kapandı (Çıkış Kodu: {})", status);
-
-                    } else {
-                        println!("⚠️ Bu oyun için otomatik başlatma verisi (executable) tanımlanmamış.");
-                        println!("📂 Dosyalara şu dizinden ulaşabilirsiniz: {:?}", cache_path);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("❌ Oyunu indirirken bir hata oluştu: {}", e);
+            if let Ok(_path) = crate::network::fetch_game(id, None).await {
+                if let Err(e) = crate::network::launch_game(&game) {
+                    eprintln!("❌ Başlatma hatası: {}", e);
                 }
             }
         }
+        
         Commands::Ui => {
             println!("🎨 Fairplay arayüzü başlatılıyor...");
             let options = eframe::NativeOptions {
@@ -254,87 +350,4 @@ async fn main() {
             ).unwrap();
         }
     }
-}
-
-// --- GÜNCELLENMİŞ GUI KODLARI BAŞLANGICI ---
-struct FairplayApp {
-    games: Vec<crate::registry::Game>,
-}
-
-impl Default for FairplayApp {
-    fn default() -> Self {
-        Self {
-            games: crate::registry::load_games(), 
-        }
-    }
-}
-
-impl eframe::App for FairplayApp {
-    #[allow(deprecated)]
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // 1. ÜST PANEL: Başlık burada sabit kalır
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.add_space(10.0);
-            ui.vertical_centered(|ui| {
-                ui.heading("🎮 Fairplay P2P Store");
-            });
-            ui.add_space(10.0);
-        });
-
-        // 2. ALT PANEL: Yenile butonu ve alt bilgi burada sabitlenir
-        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
-            ui.add_space(10.0);
-            ui.vertical_centered(|ui| {
-                if ui.button("🔄 Kütüphaneyi Yenile").clicked() {
-                    self.games = crate::registry::load_games();
-                }
-                ui.add_space(5.0);
-                ui.label("Fairplay P2P Network - Secure & Censorship Resistant");
-            });
-            ui.add_space(10.0);
-        });
-
-        // 3. ORTA PANEL: Sadece oyun listesi (Kaydırılabilir alan)
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.games.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Ağda henüz oyun bulunamadı.\nLütfen terminalden dinlemeye (listen) devam edin...");
-                });
-            } else {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false; 2]) // Tüm alanı kaplamasını sağlar
-                    .show(ui, |ui| {
-                        ui.add_space(5.0);
-                        for game in &self.games {
-                            ui.group(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.vertical(|ui| {
-                                        ui.heading(&game.name);
-                                        ui.label(format!("v{}", game.version));
-                                    });
-                                    
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("▶ Oyna").clicked() {
-                                            println!("🚀 {} başlatılıyor...", game.name);
-                                        }
-                                    });
-                                });
-                                
-                                ui.add_space(5.0);
-                                ui.label(format!("🆔 {}", game.id));
-                                
-                                ui.horizontal(|ui| {
-                                    ui.label("🛡️");
-                                    ui.colored_label(egui::Color32::from_rgb(0, 255, 100), "Doğrulandı (Zero-TOFU)");
-                                });
-                            });
-                            ui.add_space(8.0);
-                        }
-                    });
-            }
-        });
-    }
-
-    // Derleyicinin istediği boş 'ui' metodunu buraya ekleyelim ki hata vermesin
-    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 }

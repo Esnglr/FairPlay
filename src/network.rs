@@ -2,19 +2,14 @@ use reqwest;
 use chrono::Utc;
 use std::fs;
 use std::path::PathBuf;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Write, BufRead, BufReader};
 use std::process::{Command, Stdio};
-use indicatif::{ProgressBar, ProgressStyle};
-use ssh_key::{PrivateKey};
-
-
+use ssh_key::{PrivateKey, PublicKey};
+use tokio::sync::mpsc::UnboundedSender;
+use crate::AppMessage;
 
 pub async fn start_listener(topic: &str) {
     println!("👂 IPFS Pubsub arka planda dinleniyor: {}", topic);
-
-    use std::process::{Command, Stdio};
-    use std::io::{BufRead, BufReader};
-    use ssh_key::PublicKey;
 
     loop {
         println!("🔄 [SİSTEM] IPFS CLI üzerinden frekansa bağlanılıyor...");
@@ -35,7 +30,6 @@ pub async fn start_listener(topic: &str) {
                     let line = line.trim();
                     if line.is_empty() { continue; }
                     
-                    // IPFS CLI doğrudan ham JSON string'ini ekrana basar! Base64 çözmeye gerek yok.
                     if let Ok(oyun) = serde_json::from_str::<crate::registry::Game>(line) {
                         // 1. AŞAMA: PLATFORM SERTİFİKASI DOĞRULAMASI
                         let cert_payload = format!("{}:{}", oyun.id, oyun.developer_pubkey);
@@ -86,7 +80,6 @@ pub async fn start_listener(topic: &str) {
     }
 }
 
-// Oyun yayınlama fonksiyonu
 pub async fn publish_game(
     name: &str, 
     file_path: &str, 
@@ -99,13 +92,12 @@ pub async fn publish_game(
     cert: String
 ) -> Result<(), Box<dyn std::error::Error>> {
     
-    // SSH Anahtarını Yükle
     let key_path = private_key_path.unwrap_or_else(|| {
         let mut p = dirs::home_dir().unwrap();
         p.push(".ssh"); p.push("id_ed25519");
         p.to_string_lossy().to_string()
     });
-    // DÜZELTME 3: &key_path yerine std::path::Path::new(&key_path) kullanıldı
+    
     let private_key = PrivateKey::read_openssh_file(std::path::Path::new(&key_path))
         .map_err(|_| format!("SSH Özel Anahtarı bulunamadı: {}. Lütfen 'ssh-keygen -t ed25519' ile bir anahtar oluşturun.", key_path))?;
     let pub_key_str = private_key.public_key().to_openssh()?;
@@ -126,13 +118,11 @@ pub async fn publish_game(
         generated_cid
     };
 
-    // ID BELİRLEME: Güncelleme ise var olanı kullan, ilk yükleme ise yeni UUID üret
     let id = existing_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    // İMZA OLUŞTURMA: ID + Name + CID + Version
     let payload_to_sign = format!("{}:{}:{}:{}", id, name, cid, version);
     let signature = private_key.sign("fairplay-namespace", ssh_key::HashAlg::Sha256, payload_to_sign.as_bytes())?;
-    let signature_str = signature.to_string(); // SshSig to string
+    let signature_str = signature.to_string(); 
     
     let game = crate::registry::Game {
         id: id.clone(),
@@ -168,7 +158,6 @@ pub async fn publish_game(
             println!("🎉 Oyun (v{}) ağa başarıyla imzalanıp yayınlandı! (ID: {})", version, id);
         }
         
-        // Kendi anonsumuzu yerel registry'ye kaydedelim
         if let Err(e) = crate::registry::save_game(game) {
             eprintln!("{}", e);
         }
@@ -180,67 +169,88 @@ pub async fn publish_game(
     Ok(())
 }
 
-pub async fn fetch_game(id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub async fn fetch_game(id: &str, tx: Option<UnboundedSender<AppMessage>>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let games = crate::registry::load_games();
     let game = games.iter().find(|g| g.id == id).ok_or("Kayıtlarda bu ID ile oyun bulunamadı!")?;
     let cid = &game.cid;
 
     let mut cache_dir = dirs::home_dir().ok_or("HOME dizini bulunamadı")?;
-    cache_dir.push(".fairplay");
-    cache_dir.push("cache");
-    cache_dir.push(id); 
+    cache_dir.push(".fairplay"); cache_dir.push("cache"); cache_dir.push(id); 
 
-    if cache_dir.exists() {
-        println!("⚡ Oyun zaten önbellekte (cache) mevcut. İndirme atlanıyor...");
-        return Ok(cache_dir); 
-    }
-
-    println!("📥 Oyun IPFS ağından indiriliyor (CID: {})...", cid);
+    if cache_dir.exists() { return Ok(cache_dir); }
 
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:5001/api/v0/get?arg={}", cid);
+    let mut response = client.post(&url).send().await?;
     
-    let response = client.post(&url).send().await?;
-    
-    if !response.status().is_success() {
-        return Err(format!("IPFS indirme hatası: Çıktı kodu {}", response.status()).into());
-    }
+    if !response.status().is_success() { return Err("IPFS indirme hatası".into()); }
 
-    let total_size = response.content_length();
-    let pb = match total_size {
-        Some(size) => ProgressBar::new(size), 
-        None => ProgressBar::new_spinner(),   
-    };
-
-    let style = if total_size.is_some() {
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-            .unwrap()
-            .progress_chars("#>-")
-    } else {
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} [{elapsed_precise}] 📥 İndirilen Veri: {bytes} ({bytes_per_sec})")
-            .unwrap()
-    };
-    pb.set_style(style);
-
+    let total_size = response.content_length().unwrap_or(1);
+    let mut downloaded: u64 = 0;
     let mut bytes = Vec::new();
-    let mut mut_response = response;
 
-    while let Some(chunk) = mut_response.chunk().await? {
-        pb.inc(chunk.len() as u64);       
-        bytes.extend_from_slice(&chunk);  
+    while let Some(chunk) = response.chunk().await? {
+        downloaded += chunk.len() as u64;
+        bytes.extend_from_slice(&chunk);
+        
+        if let Some(sender) = &tx {
+            let progress = (downloaded as f32) / (total_size as f32);
+            let _ = sender.send(AppMessage::DownloadProgress { 
+                game_id: id.to_string(), 
+                progress 
+            });
+        }
     }
-    pb.finish_with_message("✅ İndirme tamamlandı!");
 
-    println!("📦 Arşiv çıkartılıyor (Extract) -> {:?}", cache_dir);
     fs::create_dir_all(&cache_dir)?;
-    
     let cursor = Cursor::new(bytes);
     let mut archive = tar::Archive::new(cursor);
     archive.unpack(&cache_dir)?;
 
-    println!("✅ Oyun başarıyla çıkartıldı ve diskte hazır!");
-
     Ok(cache_dir)
+}
+
+pub fn launch_game(game: &crate::registry::Game) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cache_path = dirs::home_dir().ok_or("HOME dizini bulunamadı")?;
+    cache_path.push(".fairplay"); cache_path.push("cache"); cache_path.push(&game.id);
+
+    if let Some(exec_path) = &game.executable {
+        let mut full_exec_path = cache_path.join(exec_path);
+
+        if !full_exec_path.exists() {
+            let file_name = std::path::Path::new(exec_path).file_name().unwrap();
+            let alt_path_1 = cache_path.join(&game.cid).join(exec_path);
+            let alt_path_2 = cache_path.join(&game.cid).join(file_name);
+            let alt_path_3 = cache_path.join(file_name);
+
+            if alt_path_1.exists() { full_exec_path = alt_path_1; } 
+            else if alt_path_2.exists() { full_exec_path = alt_path_2; } 
+            else if alt_path_3.exists() { full_exec_path = alt_path_3; }
+        }
+
+        if !full_exec_path.exists() {
+            return Err(format!("Çalıştırılabilir dosya bulunamadı: {}", exec_path).into());
+        }
+
+        let work_dir = full_exec_path.parent().unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(&full_exec_path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(&full_exec_path, perms);
+            }
+        }
+
+        let mut child = std::process::Command::new(&full_exec_path)
+            .current_dir(work_dir)
+            .spawn()?;
+        
+        child.wait()?;
+        Ok(())
+    } else {
+        Err("Bu oyun için otomatik başlatma verisi (executable) tanımlanmamış.".into())
+    }
 }

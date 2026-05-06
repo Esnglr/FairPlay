@@ -48,13 +48,12 @@ pub fn load_games() -> Vec<Game> {
     serde_json::from_str(&data).unwrap_or_else(|_| Vec::new())
 }
 
-// ARTIK BAŞARI VEYA HATA (Result) DÖNÜYOR
 pub fn save_game(new_game: Game) -> Result<(), String> {
     let mut games = load_games();
 
     if new_game.cid == "NULL" {
         games.retain(|g| g.id != new_game.id);
-        println!("🗑️  Oyun (ID: {}) geliştiricisi tarafından yayından kaldırıldı.", new_game.id);
+        println!("🗑️ Oyun (ID: {}) geliştiricisi tarafından yayından kaldırıldı.", new_game.id);
     } else {
         if let Some(existing_game) = games.iter_mut().find(|g| g.id == new_game.id) {
             
@@ -68,14 +67,9 @@ pub fn save_game(new_game: Game) -> Result<(), String> {
                 return Err(format!("⚠️ SÜRÜM DÜŞÜRME ENGELLENDİ: Gelen sürüm (v{}) mevcut sürümden (v{}) daha eski.", new_game.version, existing_game.version));
             }
 
+            // GÜNCELLEME: Rust'ın dereference özelliğini kullanarak tüm yapıyı tek seferde güvenle güncelliyoruz
             if new_game.version > existing_game.version || new_game.timestamp > existing_game.timestamp {
-                existing_game.cid = new_game.cid;
-                existing_game.name = new_game.name;
-                existing_game.executable = new_game.executable;
-                existing_game.timestamp = new_game.timestamp;
-                existing_game.version = new_game.version;
-                existing_game.signature = new_game.signature;
-                existing_game.platform_certificate = new_game.platform_certificate;
+                *existing_game = new_game; 
             }
         } else {
             games.push(new_game);
@@ -87,4 +81,14 @@ pub fn save_game(new_game: Game) -> Result<(), String> {
     fs::write(path, data).map_err(|e| e.to_string())?;
     
     Ok(())
+}
+
+pub fn is_game_in_cache(id: &str) -> bool {
+    if let Some(mut path) = dirs::home_dir() {
+        path.push(".fairplay");
+        path.push("cache");
+        path.push(id);
+        return path.exists();
+    }
+    false
 }
