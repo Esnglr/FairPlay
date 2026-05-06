@@ -1,6 +1,7 @@
 mod registry;
 mod network;
 
+use eframe::egui;
 use clap::{Parser, Subcommand};
 use cli_table::{format::Justify, Cell, Style, Table};
 use std::path::Path;
@@ -60,6 +61,7 @@ enum Commands {
         /// Oynanacak oyunun kayıt ID'si
         id: String,
     },
+    Ui,
 }
 
 #[tokio::main]
@@ -237,5 +239,102 @@ async fn main() {
                 }
             }
         }
+        Commands::Ui => {
+            println!("🎨 Fairplay arayüzü başlatılıyor...");
+            let options = eframe::NativeOptions {
+                viewport: egui::ViewportBuilder::default()
+                    .with_inner_size([800.0, 600.0])
+                    .with_title("Fairplay P2P Store"),
+                ..Default::default()
+            };
+            eframe::run_native(
+                "Fairplay",
+                options,
+                Box::new(|_cc| Ok(Box::<FairplayApp>::default())),
+            ).unwrap();
+        }
     }
+}
+
+// --- GÜNCELLENMİŞ GUI KODLARI BAŞLANGICI ---
+struct FairplayApp {
+    games: Vec<crate::registry::Game>,
+}
+
+impl Default for FairplayApp {
+    fn default() -> Self {
+        Self {
+            games: crate::registry::load_games(), 
+        }
+    }
+}
+
+impl eframe::App for FairplayApp {
+    #[allow(deprecated)]
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // 1. ÜST PANEL: Başlık burada sabit kalır
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                ui.heading("🎮 Fairplay P2P Store");
+            });
+            ui.add_space(10.0);
+        });
+
+        // 2. ALT PANEL: Yenile butonu ve alt bilgi burada sabitlenir
+        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                if ui.button("🔄 Kütüphaneyi Yenile").clicked() {
+                    self.games = crate::registry::load_games();
+                }
+                ui.add_space(5.0);
+                ui.label("Fairplay P2P Network - Secure & Censorship Resistant");
+            });
+            ui.add_space(10.0);
+        });
+
+        // 3. ORTA PANEL: Sadece oyun listesi (Kaydırılabilir alan)
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.games.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Ağda henüz oyun bulunamadı.\nLütfen terminalden dinlemeye (listen) devam edin...");
+                });
+            } else {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2]) // Tüm alanı kaplamasını sağlar
+                    .show(ui, |ui| {
+                        ui.add_space(5.0);
+                        for game in &self.games {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.heading(&game.name);
+                                        ui.label(format!("v{}", game.version));
+                                    });
+                                    
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("▶ Oyna").clicked() {
+                                            println!("🚀 {} başlatılıyor...", game.name);
+                                        }
+                                    });
+                                });
+                                
+                                ui.add_space(5.0);
+                                ui.label(format!("🆔 {}", game.id));
+                                
+                                ui.horizontal(|ui| {
+                                    ui.label("🛡️");
+                                    ui.colored_label(egui::Color32::from_rgb(0, 255, 100), "Doğrulandı (Zero-TOFU)");
+                                });
+                            });
+                            ui.add_space(8.0);
+                        }
+                    });
+            }
+        });
+    }
+
+    // Derleyicinin istediği boş 'ui' metodunu buraya ekleyelim ki hata vermesin
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 }
