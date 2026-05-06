@@ -36,10 +36,9 @@ publish-test:
 	@echo "Oyun JSON konfigürasyonu kullanılarak ağa duyuruluyor..."
 	cargo run -- publish test.json
 
-# Projeyi derleyip PATH'e kopyalama (Secureblue için ~/.local/bin/ dizini kullanıldı)
+# Projeyi derleme
 install:
-	@echo "Fairplay release modunda derleniyor..."
-	cargo build --release
-	@echo "Çalıştırılabilir dosya sisteme kopyalanıyor (~/.local/bin/)..."
-	mkdir -p ~/.local/bin
-	cp target/release/fairplay ~/.local/bin/
+	@echo "Fairplay derleniyor ve sisteme kuruluyor..."
+	cargo install --path .
+	@echo "Kurulum başarıyla tamamlandı! Uygulama başlatılıyor..."
+	fairplay
