@@ -11,7 +11,6 @@ use std::path::PathBuf;
 
 // --- STATE VE MESAJLAŞMA ---
 pub enum AppMessage {
-    // DÜZELTME: MB sayacı için downloaded field'ı eklendi
     DownloadProgress { game_id: String, progress: f32, downloaded: u64 },
     DownloadComplete { game_id: String, path: PathBuf },
     GameStarted { game_id: String },
@@ -31,9 +30,10 @@ struct FairplayApp {
     state: AppState,
     msg_receiver: UnboundedReceiver<AppMessage>,
     msg_sender: UnboundedSender<AppMessage>,
-    // YENİ: Ağ bağlantısı için durum değişkenleri
     channel_input: String,
     is_listening: bool,
+    // YENİ: Arka plan dinleme görevini takip edip durdurabilmek için Handle
+    listener_handle: Option<tokio::task::JoinHandle<()>>, 
 }
 
 impl Default for FairplayApp {
@@ -46,6 +46,7 @@ impl Default for FairplayApp {
             msg_sender: tx,
             channel_input: "fairplay-games".to_string(),
             is_listening: false,
+            listener_handle: None,
         }
     }
 }
@@ -75,7 +76,7 @@ impl eframe::App for FairplayApp {
             }
         }
 
-        // ÜST PANEL: Bağlantı Kontrolleri Eklendi
+        // ÜST PANEL: Dinamik Bağlan / Durdur Kontrolleri
         egui::Panel::top("top_panel").frame(
             egui::Frame::default().fill(egui::Color32::from_rgb(20, 20, 25)).inner_margin(15.0)
         ).show(ctx, |ui| {
@@ -86,20 +87,27 @@ impl eframe::App for FairplayApp {
                 ui.separator();
                 ui.add_space(20.0);
 
-                // YENİ: Manuel Kanal Bağlantı Alanı
                 ui.label("Ağ Kanalı:");
                 ui.add(egui::TextEdit::singleline(&mut self.channel_input).desired_width(120.0));
                 
                 if self.is_listening {
                     ui.label(egui::RichText::new("📡 Dinleniyor...").color(egui::Color32::LIGHT_GREEN));
+                    // YENİ: Görevi İptal Etme (Abort) Butonu
+                    if ui.button("⏹ Durdur").clicked() {
+                        if let Some(handle) = self.listener_handle.take() {
+                            handle.abort(); // Tokio görevini anında sonlandır
+                        }
+                        self.is_listening = false;
+                    }
                 } else {
-                    if ui.button("Bağlan").clicked() {
+                    if ui.button("▶ Bağlan").clicked() {
                         self.is_listening = true;
                         let channel = self.channel_input.clone();
-                        // Asenkron Dinleyiciyi Arka Planda Başlat
-                        tokio::spawn(async move {
+                        // Görevi başlat ve Handle'ı kaydet
+                        let handle = tokio::spawn(async move {
                             crate::network::start_listener(&channel).await;
                         });
+                        self.listener_handle = Some(handle);
                     }
                 }
 
@@ -156,7 +164,6 @@ impl eframe::App for FairplayApp {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     match &self.state {
                                         AppState::Downloading { game_id, progress, downloaded } if game_id == &game.id => {
-                                            // YENİ: Boyut biliniyorsa bar, bilinmiyorsa (chunked) spinner ve MB gösterimi
                                             if *progress >= 0.0 {
                                                 ui.add(egui::ProgressBar::new(*progress).show_percentage().animate(true).desired_width(150.0));
                                             } else {

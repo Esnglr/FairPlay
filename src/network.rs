@@ -2,8 +2,7 @@ use reqwest;
 use chrono::Utc;
 use std::fs;
 use std::path::PathBuf;
-use std::io::{Cursor, Write, BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::io::Cursor;
 use ssh_key::{PrivateKey, PublicKey};
 use tokio::sync::mpsc::UnboundedSender;
 use crate::AppMessage;
@@ -11,70 +10,83 @@ use crate::AppMessage;
 pub async fn start_listener(topic: &str) {
     println!("👂 IPFS Pubsub arka planda dinleniyor: {}", topic);
 
+    use tokio::process::Command;
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
     loop {
         println!("🔄 [SİSTEM] IPFS CLI üzerinden frekansa bağlanılıyor...");
         
+        // YENİ: tokio::process kullanıldı ve kill_on_drop aktif edildi!
         let mut child = Command::new("ipfs")
             .arg("pubsub").arg("sub").arg(topic)
             .stdout(Stdio::piped())
+            .kill_on_drop(true) // Görev sonlanırsa process de ölür (Zombi bırakmaz)
             .spawn()
             .expect("❌ IPFS CLI başlatılamadı");
 
         println!("✅ [SİSTEM] Kanal açıldı. Frekans dinleniyor...");
 
         if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
             
-            for line_result in reader.lines() {
-                if let Ok(line) = line_result {
-                    let line = line.trim();
-                    if line.is_empty() { continue; }
+            // YENİ: Asenkron Non-blocking IO Okuma
+            while let Ok(bytes_read) = reader.read_line(&mut line).await {
+                if bytes_read == 0 { break; } // Process kapandı (EOF)
+                
+                let trimmed = line.trim();
+                if trimmed.is_empty() { 
+                    line.clear();
+                    continue; 
+                }
+                
+                if let Ok(oyun) = serde_json::from_str::<crate::registry::Game>(trimmed) {
+                    let cert_payload = format!("{}:{}", oyun.id, oyun.developer_pubkey);
+                    let master_key_res = PublicKey::from_openssh(crate::registry::MASTER_PUBKEY);
                     
-                    if let Ok(oyun) = serde_json::from_str::<crate::registry::Game>(line) {
-                        // 1. AŞAMA: PLATFORM SERTİFİKASI DOĞRULAMASI
-                        let cert_payload = format!("{}:{}", oyun.id, oyun.developer_pubkey);
-                        let master_key_res = PublicKey::from_openssh(crate::registry::MASTER_PUBKEY);
-                        
-                        if let Ok(master_key) = master_key_res {
-                            if let Ok(platform_sig) = oyun.platform_certificate.parse::<ssh_key::SshSig>() {
-                                if master_key.verify("fairplay-namespace", cert_payload.as_bytes(), &platform_sig).is_err() {
-                                    eprintln!("\n🚨 [REDDEDİLDİ] '{}' için sahte geliştirici anahtarı tespit edildi! (Sertifika Geçersiz)", oyun.name);
-                                    continue;
-                                }
-                            } else {
-                                eprintln!("\n🚨 [REDDEDİLDİ] '{}' oyununun sertifika formatı bozuk!", oyun.name);
+                    if let Ok(master_key) = master_key_res {
+                        if let Ok(platform_sig) = oyun.platform_certificate.parse::<ssh_key::SshSig>() {
+                            if master_key.verify("fairplay-namespace", cert_payload.as_bytes(), &platform_sig).is_err() {
+                                eprintln!("\n🚨 [REDDEDİLDİ] '{}' için sahte geliştirici anahtarı tespit edildi!", oyun.name);
+                                line.clear();
                                 continue;
                             }
                         } else {
-                            eprintln!("\n⚠️ [SİSTEM HATASI] MASTER_PUBKEY geçersiz! Lütfen registry.rs dosyasını güncelleyin.");
+                            eprintln!("\n🚨 [REDDEDİLDİ] '{}' oyununun sertifika formatı bozuk!", oyun.name);
+                            line.clear();
                             continue;
                         }
+                    } else {
+                        eprintln!("\n⚠️ [SİSTEM HATASI] MASTER_PUBKEY geçersiz!");
+                        line.clear();
+                        continue;
+                    }
 
-                        // 2. AŞAMA: GELİŞTİRİCİ İMZASI DOĞRULAMASI
-                        let payload_to_verify = format!("{}:{}:{}:{}", oyun.id, oyun.name, oyun.cid, oyun.version);
-                        
-                        let is_valid = PublicKey::from_openssh(&oyun.developer_pubkey)
-                            .and_then(|pub_key| {
-                                let signature = oyun.signature.parse::<ssh_key::SshSig>().map_err(|_| ssh_key::Error::Crypto)?;
-                                pub_key.verify("fairplay-namespace", payload_to_verify.as_bytes(), &signature)
-                            });
+                    let payload_to_verify = format!("{}:{}:{}:{}", oyun.id, oyun.name, oyun.cid, oyun.version);
+                    
+                    let is_valid = PublicKey::from_openssh(&oyun.developer_pubkey)
+                        .and_then(|pub_key| {
+                            let signature = oyun.signature.parse::<ssh_key::SshSig>().map_err(|_| ssh_key::Error::Crypto)?;
+                            pub_key.verify("fairplay-namespace", payload_to_verify.as_bytes(), &signature)
+                        });
 
-                        if is_valid.is_ok() {
-                            println!("\n🔐 [GÜVENLİ] Sertifika ve İmza doğrulandı! Geliştirici yetkili.");
-                            if let Err(e) = crate::registry::save_game(oyun.clone()) {
-                                eprintln!("❌ Kayıt Hatası: {}", e);
-                            } else {
-                                println!("🎉 [BAŞARI] OYUN AĞDAN ALINDI: {} (v{})", oyun.name, oyun.version);
-                            }
+                    if is_valid.is_ok() {
+                        println!("\n🔐 [GÜVENLİ] Sertifika ve İmza doğrulandı! Geliştirici yetkili.");
+                        if let Err(e) = crate::registry::save_game(oyun.clone()) {
+                            eprintln!("❌ Kayıt Hatası: {}", e);
                         } else {
-                            eprintln!("\n🚨 [TEHLİKE] {} adlı oyunun içeriği değiştirilmiş! (İmza Geçersiz)", oyun.name);
+                            println!("🎉 [BAŞARI] OYUN AĞDAN ALINDI: {} (v{})", oyun.name, oyun.version);
                         }
+                    } else {
+                        eprintln!("\n🚨 [TEHLİKE] {} adlı oyunun içeriği değiştirilmiş! (İmza Geçersiz)", oyun.name);
                     }
                 }
+                line.clear(); // Buffer'ı temizle
             }
         }
         
-        let _ = child.wait();
+        let _ = child.wait().await;
         println!("⚠️ [SİSTEM] IPFS bağlantısı koptu, 2 saniye sonra yeniden bağlanılacak...");
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     }
@@ -107,7 +119,7 @@ pub async fn publish_game(
         "NULL".to_string()
     } else {
         println!("📦 Klasör/Dosya IPFS ağına yükleniyor...");
-        let add_output = Command::new("ipfs")
+        let add_output = std::process::Command::new("ipfs")
             .arg("add").arg("-r").arg("-Q").arg(file_path).output()?;
 
         if !add_output.status.success() {
@@ -140,12 +152,13 @@ pub async fn publish_game(
     game_json.push('\n'); 
     println!("📢 Anons '{}' kanalındaki Peer'lara duyuruluyor...", channel);
     
-    let mut child = Command::new("ipfs")
+    let mut child = std::process::Command::new("ipfs")
         .arg("pubsub").arg("pub").arg(channel)
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
         .spawn()?;
 
     if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
         stdin.write_all(game_json.as_bytes())?;
     }
 
@@ -185,8 +198,7 @@ pub async fn fetch_game(id: &str, tx: Option<UnboundedSender<AppMessage>>) -> Re
     
     if !response.status().is_success() { return Err("IPFS indirme hatası".into()); }
 
-    // DÜZELTME: Boyut bilinmiyorsa (chunked payload) Option olarak bırakıyoruz
-    let total_size = response.content_length(); 
+    let total_size = response.content_length();
     let mut downloaded: u64 = 0;
     let mut bytes = Vec::new();
 
@@ -195,12 +207,11 @@ pub async fn fetch_game(id: &str, tx: Option<UnboundedSender<AppMessage>>) -> Re
         bytes.extend_from_slice(&chunk);
         
         if let Some(sender) = &tx {
-            // Boyut belliyse % hesabı yap, değilse -1.0 flag'i gönder (UI spinner gösterecek)
             let progress = total_size.map(|t| (downloaded as f32) / (t as f32)).unwrap_or(-1.0);
             let _ = sender.send(AppMessage::DownloadProgress { 
                 game_id: id.to_string(), 
                 progress,
-                downloaded // MB gösterimi için ham veriyi de aktarıyoruz
+                downloaded
             });
         }
     }
