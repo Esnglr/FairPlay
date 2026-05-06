@@ -1,4 +1,4 @@
-# Fairplay - Otomasyon ve Kullanım Kılavuzu
+# Fairplay - P2P Oyun Platformu
 
 Bu proje, IPFS ve P2P ağ işlemlerini kolaylaştırmak için bir `Makefile` içerir. Aşağıdaki komutları kullanarak kurulum, test ve derleme işlemlerini hızlıca yapabilirsiniz.
 
