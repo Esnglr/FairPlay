@@ -1,11 +1,34 @@
 mod registry;
 mod network;
+
 use clap::{Parser, Subcommand};
 use cli_table::{format::Justify, Cell, Style, Table};
+use std::path::Path;
+use serde::Deserialize;
+use std::fs;
+
+#[derive(Deserialize)]
+struct PublishConfig {
+    name: String,
+    path: String,
+    #[serde(default = "default_channel")]
+    channel: String,
+    executable: Option<String>,
+    id: Option<String>,
+    #[serde(default)]
+    unpublish: bool,
+    #[serde(default = "default_version")]
+    version: u32,
+    private_key: Option<String>,
+    cert: String,
+}
+
+// JSON'da channel ve version girilmezse kullanılacak varsayılan değerler
+fn default_channel() -> String { "fairplay-games".to_string() }
+fn default_version() -> u32 { 1 }
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
-#[command(propagate_version = true)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -13,32 +36,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Pin signing key of a game developer to specific game ID
+    SignDev {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        dev_pubkey: String,
+    },
     /// Yeni bir oyunu IPFS ağına yükle ve duyur
     Publish {
-        /// Oyunun adı
-        #[arg(short, long)]
-        name: String,
-        /// Oyun dosyası veya dizininin yolu
-        #[arg(short, long)]
-        path: String,
-        #[arg(short, long, default_value = "fairplay-games")]
-        channel: String,
-        #[arg(short, long)]
-        executable: Option<String>,
-        #[arg(long)]
-        id: Option<String>,
-        /// YENİ: Oyunu yayından kaldırmak için bayrak
-        #[arg(long, default_value_t = false)]
-        unpublish: bool,
+        config_file: String,
     },
     /// Ağdan duyulan mevcut oyunları listele
     List,
     /// Ağı sürekli dinleyerek yeni oyunları keşfeder (Kapatana kadar çalışır)
-    Listen, // <--- EKSİK OLAN SATIR BURASIYDI!
-    /// Bir oyunu ID ile indir ve izole ortamda (sandbox) çalıştır
+    Listen,
+    /// Belirtilen özel bir kanalı dinleyerek keşif yapar
     Connect {
         channel: String,
     },
+    /// Bir oyunu ID ile indir ve izole ortamda (sandbox) çalıştır
     Play {
         /// Oynanacak oyunun kayıt ID'si
         id: String,
@@ -49,37 +66,70 @@ enum Commands {
 async fn main() {
     registry::init();
 
-    // DİKKAT: Buradaki tokio::spawn bloğunu tamamen sildik!
-
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Publish { name, path, channel, executable, id, unpublish } => {
-            println!("🚀 İşlem başlatıldı: {} (Yol: {}, Kanal: {})", name, path, channel);
-            // channel parametresini fonksiyona iletiyoruz
-            if let Err(e) = network::publish_game(name, path, channel, executable.clone(), id.clone(), *unpublish).await {
-                eprintln!("Yayınlama başarısız oldu: {}", e);
+        Commands::SignDev { id, dev_pubkey } => {
+            let private_key_path = dirs::home_dir().unwrap().join(".fairplay-admin/fairplay-admin-key");
+            let private_key = ssh_key::PrivateKey::read_openssh_file(&private_key_path)
+                .expect("Admin private key not found! Lütfen anahtarın ~/.fairplay-admin/fair-admin-key konumunda olduğundan emin olun.");
+
+            let payload = format!("{}:{}", id, dev_pubkey);
+            
+            // DÜZELTME 1: HashAlg::Sha256 eklendi
+            let signature = private_key.sign("fairplay-namespace", ssh_key::HashAlg::Sha256, payload.as_bytes()).unwrap();
+            
+            // DÜZELTME 2: Base64 çevirisi yerine doğrudan SSH İmza string'ini (PEM) alıyoruz
+            let cert_str = signature.to_string(); 
+
+            println!("✅ Game developer certificate created!");
+            println!("Game ID: {}", id);
+            println!("Certificate (owned by game developer):\n{}", cert_str);
+        }
+        Commands::Publish { config_file } => {
+            // 1. JSON dosyasını oku
+            let file_content = fs::read_to_string(config_file)
+                .expect("❌ JSON konfigürasyon dosyası okunamadı! Dosya yolunu kontrol edin.");
+            
+            // 2. JSON metnini Rust objesine (PublishConfig) çevir
+            let config: PublishConfig = serde_json::from_str(&file_content)
+                .expect("❌ JSON dosyası ayrıştırılamadı. Virgülleri veya formatı kontrol edin.");
+
+            println!("🚀 Process started: {} (v{})", config.name, config.version);
+            
+            // 3. Değerleri mevcut çalışan publish_game fonksiyonuna pasla
+            if let Err(e) = network::publish_game(
+                &config.name,
+                &config.path,
+                &config.channel,
+                config.executable,
+                config.id,
+                config.unpublish,
+                config.version,
+                config.private_key,
+                config.cert
+            ).await {
+                eprintln!("❌ Publish failed: {}", e);
             }
         }
+        
         Commands::List => {
             println!("🔍 Yerel registry'deki oyunlar listeleniyor...\n");
             
-            // Task 6.1: Veritabanından oyunları RAM'e çekiyoruz[cite: 1]
             let mut games = registry::load_games();
 
             if games.is_empty() {
                 println!("⚠️ Henüz keşfedilmiş bir oyun yok. 'listen' komutuyla ağı dinlemeye başlayın!");
             } else {
-                // Task 6.2: Algoritmasız, saf kronolojik sıralama (En yeni en üstte)[cite: 1]
+                // Algoritmasız, saf kronolojik sıralama (En yeni en üstte)
                 games.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
-                // Task 6.3: cli-table ile terminalde şık gösterim
+                // cli-table ile terminalde şık gösterim
                 let mut table_rows = Vec::new();
                 
                 for (idx, game) in games.iter().enumerate() {
                     let date_str = game.timestamp.format("%Y-%m-%d %H:%M").to_string();
                     
-                    // Her bir satırı tabloya ekliyoruz
                     table_rows.push(vec![
                         (idx + 1).cell().justify(Justify::Right),
                         game.name.clone().cell(),
@@ -88,7 +138,6 @@ async fn main() {
                     ]);
                 }
 
-                // Tablonun başlıkları ve genel stili
                 let table = table_rows
                     .table()
                     .title(vec![
@@ -104,17 +153,19 @@ async fn main() {
                 println!("\n💡 Oynamak için: cargo run -- play <CID>");
             }
         }
-        // YENİ EKLENEN KISIM:
+
         Commands::Listen => {
             println!("👂 P2P Ağı dinleniyor... (Çıkmak için Ctrl+C'ye basın)");
-            // await kullandığımız için program burada asılı kalır ve kapanmaz
             network::start_listener("fairplay-games").await; 
         }
+
         Commands::Connect { channel } => {
-            println!("Ozel kanala kilitleniyor: {}", channel);
-            network::start_listener(channel).await;}
+            println!("🔗 Özel kanala kilitleniyor: {}", channel);
+            network::start_listener(channel).await;
+        }
+
         Commands::Play { id } => {
-            let mut games = crate::registry::load_games();
+            let games = crate::registry::load_games();
             let game = games.into_iter().find(|g| g.id == *id).expect("❌ Oyun kayıtlı değil! Önce listelemeniz gerekebilir.");
 
             println!("🎮 '{}' için hazırlıklar başlatılıyor...", game.name);
@@ -129,11 +180,11 @@ async fn main() {
 
                         // Verilen yol doğrudan çalışmıyorsa IPFS hiyerarşisinde dosyayı ara
                         if !full_exec_path.exists() {
-                            let file_name = std::path::Path::new(&exec_path).file_name().unwrap();
+                            let file_name = Path::new(&exec_path).file_name().unwrap();
                             
-                            // İhtimal 1: IPFS arşivi her şeyi CID isimli bir klasöre koyar (cache/CID/CID/dwarfort)
+                            // İhtimal 1: IPFS arşivi her şeyi CID isimli bir klasöre koyar
                             let alt_path_1 = cache_path.join(id).join(file_name);
-                            // İhtimal 2: Direkt cache klasörünün altına inmiştir (cache/CID/dwarfort)
+                            // İhtimal 2: Direkt cache klasörünün altına inmiştir
                             let alt_path_2 = cache_path.join(file_name);
 
                             if alt_path_1.exists() {
@@ -168,7 +219,7 @@ async fn main() {
                         // Oyunu Başlat
                         println!("==================================================");
                         let mut child = std::process::Command::new(&full_exec_path)
-                            .current_dir(work_dir) // <--- OYUNUN YANINDAKİ KLASÖRLERİ GÖREBİLMESİ İÇİN
+                            .current_dir(work_dir) // OYUNUN YANINDAKİ KLASÖRLERİ GÖREBİLMESİ İÇİN
                             .spawn()
                             .expect("❌ Oyun başlatılamadı! Dosya bozuk veya uyumsuz olabilir.");
                         

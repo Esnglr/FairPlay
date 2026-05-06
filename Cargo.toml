@@ -21,3 +21,4 @@ cli-table = "0.5.0"
 tar = "0.4.45"
 indicatif = "0.18.4"
 uuid = { version = "1.23.1", features = ["v4"] }
+ssh-key = { version = "0.6.7", features = ["crypto", "ed25519"] }

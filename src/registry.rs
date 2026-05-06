@@ -4,35 +4,39 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 
+// PLATFORM KÖK ANAHTARI (Hardcoded Root of Trust)
+// DİKKAT: Buradaki değeri kendi `cat ~/.ssh/id_ed25519.pub` çıktınla değiştirmeyi unutma!
+pub const MASTER_PUBKEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHXZNPx5PmisWZxvbMFQGsHnqRpBNve/6nKR9LQGN1o/ fairplay-admin";
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Game {
-	pub id: String,
-	pub name: String,
-	pub cid: String,
-	pub timestamp: DateTime<Utc>,
-        pub executable: Option<String>,
+    pub id: String,
+    pub name: String,
+    pub cid: String,
+    pub timestamp: DateTime<Utc>,
+    pub executable: Option<String>,
+    pub version: u32,
+    pub developer_pubkey: String,
+    pub platform_certificate: String,
+    pub signature: String,
 }
 
 fn get_registry_path() -> PathBuf {
-    let mut path = dirs::home_dir().expect("HOME is not found");
+    let mut path = dirs::home_dir().expect("Home dizini bulunamadı");
     path.push(".fairplay");
-    
-    // Klasör yoksa oluştur
-    if !path.exists() {
-        fs::create_dir_all(&path).expect("~/.fairplay couldnt created");
-    }
-    
     path.push("registry.json");
     path
 }
 
 pub fn init() {
-	let path = get_registry_path();
-        if !path.exists() {
-        	let mut file = File::create(&path).expect("Couldn't create registery.json");
-        	file.write_all(b"[]").expect("Couldn't write entry data");
-        	println!("Created new registery file: {:?}", path);
-        }
+    let path = get_registry_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("Fairplay dizini oluşturulamadı");
+    }
+    if !path.exists() {
+        let mut file = File::create(&path).expect("Registry dosyası oluşturulamadı");
+        file.write_all(b"[]").expect("Boş JSON yazılamadı");
+    }
 }
 
 pub fn load_games() -> Vec<Game> {
@@ -40,35 +44,47 @@ pub fn load_games() -> Vec<Game> {
     if !path.exists() {
         return Vec::new();
     }
-    
-    let data = fs::read_to_string(&path).expect("Registry okunamadi");
+    let data = fs::read_to_string(path).expect("Registry okunamadı");
     serde_json::from_str(&data).unwrap_or_else(|_| Vec::new())
 }
 
-// Task 3.4 (B): Yeni Oyun Ekleme (Save)
-pub fn save_game(new_game: Game) {
+// ARTIK BAŞARI VEYA HATA (Result) DÖNÜYOR
+pub fn save_game(new_game: Game) -> Result<(), String> {
     let mut games = load_games();
-    
-    // Tombstone Mantığı: Eğer CID "NULL" ise bu bir yayından kaldırma anonsudur
+
     if new_game.cid == "NULL" {
         games.retain(|g| g.id != new_game.id);
-        println!("🗑️  Oyun (ID: {}) yayından kaldırıldığı için listeden silindi.", new_game.id);
+        println!("🗑️  Oyun (ID: {}) geliştiricisi tarafından yayından kaldırıldı.", new_game.id);
     } else {
-        // Upsert Mantığı: Oyun zaten varsa ve yeni anons daha güncelse verileri yenile
         if let Some(existing_game) = games.iter_mut().find(|g| g.id == new_game.id) {
-            if new_game.timestamp > existing_game.timestamp {
+            
+            // KURAL 1: APP SIGNING KEY PINNING
+            if existing_game.developer_pubkey != new_game.developer_pubkey {
+                return Err(format!("🚨 GÜVENLİK İHLALİ: '{}' için sahte güncelleme! İmzalar eşleşmiyor.", new_game.name));
+            }
+
+            // KURAL 2: DOWNGRADE PROTECTION
+            if new_game.version < existing_game.version {
+                return Err(format!("⚠️ SÜRÜM DÜŞÜRME ENGELLENDİ: Gelen sürüm (v{}) mevcut sürümden (v{}) daha eski.", new_game.version, existing_game.version));
+            }
+
+            if new_game.version > existing_game.version || new_game.timestamp > existing_game.timestamp {
                 existing_game.cid = new_game.cid;
                 existing_game.name = new_game.name;
                 existing_game.executable = new_game.executable;
                 existing_game.timestamp = new_game.timestamp;
+                existing_game.version = new_game.version;
+                existing_game.signature = new_game.signature;
+                existing_game.platform_certificate = new_game.platform_certificate;
             }
         } else {
-            // Oyun sistemde hiç yoksa yeni oyun olarak ekle
             games.push(new_game);
         }
     }
-    
+
     let path = get_registry_path();
-    let data = serde_json::to_string_pretty(&games).expect("JSON serilestirilemedi");
-    std::fs::write(path, data).expect("Registry dosyasina yazilamadi");
+    let data = serde_json::to_string_pretty(&games).map_err(|e| e.to_string())?;
+    fs::write(path, data).map_err(|e| e.to_string())?;
+    
+    Ok(())
 }
