@@ -11,7 +11,8 @@ use std::path::PathBuf;
 
 // --- STATE VE MESAJLAŞMA ---
 pub enum AppMessage {
-    DownloadProgress { game_id: String, progress: f32 },
+    // DÜZELTME: MB sayacı için downloaded field'ı eklendi
+    DownloadProgress { game_id: String, progress: f32, downloaded: u64 },
     DownloadComplete { game_id: String, path: PathBuf },
     GameStarted { game_id: String },
     GameExited { game_id: String, exit_code: i32 },
@@ -21,16 +22,18 @@ pub enum AppMessage {
 #[derive(PartialEq)]
 pub enum AppState {
     Idle,
-    Downloading { game_id: String, progress: f32 },
+    Downloading { game_id: String, progress: f32, downloaded: u64 },
     Running { game_id: String },
 }
 
-// --- GÜNCELLENMİŞ GUI KODLARI ---
 struct FairplayApp {
     games: Vec<crate::registry::Game>,
     state: AppState,
     msg_receiver: UnboundedReceiver<AppMessage>,
     msg_sender: UnboundedSender<AppMessage>,
+    // YENİ: Ağ bağlantısı için durum değişkenleri
+    channel_input: String,
+    is_listening: bool,
 }
 
 impl Default for FairplayApp {
@@ -41,6 +44,8 @@ impl Default for FairplayApp {
             state: AppState::Idle,
             msg_receiver: rx,
             msg_sender: tx,
+            channel_input: "fairplay-games".to_string(),
+            is_listening: false,
         }
     }
 }
@@ -51,8 +56,8 @@ impl eframe::App for FairplayApp {
         
         while let Ok(msg) = self.msg_receiver.try_recv() {
             match msg {
-                AppMessage::DownloadProgress { game_id, progress } => {
-                    self.state = AppState::Downloading { game_id, progress };
+                AppMessage::DownloadProgress { game_id, progress, downloaded } => {
+                    self.state = AppState::Downloading { game_id, progress, downloaded };
                     ctx.request_repaint(); 
                 }
                 AppMessage::DownloadComplete { game_id: _, path: _ } => {
@@ -70,11 +75,34 @@ impl eframe::App for FairplayApp {
             }
         }
 
+        // ÜST PANEL: Bağlantı Kontrolleri Eklendi
         egui::Panel::top("top_panel").frame(
             egui::Frame::default().fill(egui::Color32::from_rgb(20, 20, 25)).inner_margin(15.0)
         ).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(egui::RichText::new("🎮 FAIRPLAY").size(24.0).color(egui::Color32::from_rgb(0, 255, 100)).strong());
+                
+                ui.add_space(20.0);
+                ui.separator();
+                ui.add_space(20.0);
+
+                // YENİ: Manuel Kanal Bağlantı Alanı
+                ui.label("Ağ Kanalı:");
+                ui.add(egui::TextEdit::singleline(&mut self.channel_input).desired_width(120.0));
+                
+                if self.is_listening {
+                    ui.label(egui::RichText::new("📡 Dinleniyor...").color(egui::Color32::LIGHT_GREEN));
+                } else {
+                    if ui.button("Bağlan").clicked() {
+                        self.is_listening = true;
+                        let channel = self.channel_input.clone();
+                        // Asenkron Dinleyiciyi Arka Planda Başlat
+                        tokio::spawn(async move {
+                            crate::network::start_listener(&channel).await;
+                        });
+                    }
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("🔄 Yenile").clicked() {
                         self.games = crate::registry::load_games();
@@ -83,6 +111,7 @@ impl eframe::App for FairplayApp {
             });
         });
 
+        // ALT PANEL
         egui::Panel::bottom("bottom_panel").show(ctx, |ui| {
             ui.add_space(5.0);
             ui.horizontal(|ui| {
@@ -98,10 +127,11 @@ impl eframe::App for FairplayApp {
             ui.add_space(5.0);
         });
 
+        // ORTA PANEL
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.games.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("Ağda henüz oyun bulunamadı.\nLütfen terminalden 'listen' komutuyla dinlemeye devam edin...").color(egui::Color32::DARK_GRAY));
+                    ui.label(egui::RichText::new("Ağda henüz oyun bulunamadı.\nLütfen yukarıdan bir kanala bağlanın ve dinlemeye başlayın...").color(egui::Color32::DARK_GRAY));
                 });
             } else {
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
@@ -125,8 +155,17 @@ impl eframe::App for FairplayApp {
                                 
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     match &self.state {
-                                        AppState::Downloading { game_id, progress } if game_id == &game.id => {
-                                            ui.add(egui::ProgressBar::new(*progress).show_percentage().animate(true).desired_width(150.0));
+                                        AppState::Downloading { game_id, progress, downloaded } if game_id == &game.id => {
+                                            // YENİ: Boyut biliniyorsa bar, bilinmiyorsa (chunked) spinner ve MB gösterimi
+                                            if *progress >= 0.0 {
+                                                ui.add(egui::ProgressBar::new(*progress).show_percentage().animate(true).desired_width(150.0));
+                                            } else {
+                                                ui.horizontal(|ui| {
+                                                    ui.add(egui::Spinner::new());
+                                                    let mb = (*downloaded as f64) / 1_048_576.0;
+                                                    ui.label(egui::RichText::new(format!("{:.1} MB İndirildi", mb)).color(egui::Color32::LIGHT_BLUE));
+                                                });
+                                            }
                                         },
                                         AppState::Running { game_id } if game_id == &game.id => {
                                             ui.add(egui::Spinner::new());
@@ -203,30 +242,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Pin signing key of a game developer to specific game ID
     SignDev {
-        #[arg(long)]
-        id: String,
-        #[arg(long)]
-        dev_pubkey: String,
+        #[arg(long)] id: String,
+        #[arg(long)] dev_pubkey: String,
     },
-    /// Yeni bir oyunu IPFS ağına yükle ve duyur
-    Publish {
-        config_file: String,
-    },
-    /// Ağdan duyulan mevcut oyunları listele
+    Publish { config_file: String },
     List,
-    /// Ağı sürekli dinleyerek yeni oyunları keşfeder (Kapatana kadar çalışır)
     Listen,
-    /// Belirtilen özel bir kanalı dinleyerek keşif yapar
-    Connect {
-        channel: String,
-    },
-    /// Bir oyunu ID ile indir ve izole ortamda (sandbox) çalıştır
-    Play {
-        /// Oynanacak oyunun kayıt ID'si
-        id: String,
-    },
+    Connect { channel: String },
+    Play { id: String },
     Ui,
 }
 
@@ -243,54 +267,35 @@ async fn main() {
                 .expect("Admin private key not found! Lütfen anahtarın ~/.fairplay-admin/fair-admin-key konumunda olduğundan emin olun.");
 
             let payload = format!("{}:{}", id, dev_pubkey);
-            
             let signature = private_key.sign("fairplay-namespace", ssh_key::HashAlg::Sha256, payload.as_bytes()).unwrap();
-            
             let cert_str = signature.to_string(); 
 
-            println!("✅ Game developer certificate created!");
-            println!("Game ID: {}", id);
-            println!("Certificate (owned by game developer):\n{}", cert_str);
+            println!("✅ Game developer certificate created!\nGame ID: {}\nCertificate:\n{}", id, cert_str);
         }
         Commands::Publish { config_file } => {
-            let file_content = fs::read_to_string(config_file)
-                .expect("❌ JSON konfigürasyon dosyası okunamadı! Dosya yolunu kontrol edin.");
-            
-            let config: PublishConfig = serde_json::from_str(&file_content)
-                .expect("❌ JSON dosyası ayrıştırılamadı. Virgülleri veya formatı kontrol edin.");
+            let file_content = fs::read_to_string(config_file).expect("❌ JSON konfigürasyon dosyası okunamadı!");
+            let config: PublishConfig = serde_json::from_str(&file_content).expect("❌ JSON dosyası ayrıştırılamadı.");
 
             println!("🚀 Process started: {} (v{})", config.name, config.version);
-            
             if let Err(e) = network::publish_game(
-                &config.name,
-                &config.path,
-                &config.channel,
-                config.executable,
-                config.id,
-                config.unpublish,
-                config.version,
-                config.private_key,
-                config.cert
+                &config.name, &config.path, &config.channel, config.executable,
+                config.id, config.unpublish, config.version, config.private_key, config.cert
             ).await {
                 eprintln!("❌ Publish failed: {}", e);
             }
         }
-        
         Commands::List => {
             println!("🔍 Yerel registry'deki oyunlar listeleniyor...\n");
-            
             let mut games = registry::load_games();
 
             if games.is_empty() {
                 println!("⚠️ Henüz keşfedilmiş bir oyun yok. 'listen' komutuyla ağı dinlemeye başlayın!");
             } else {
                 games.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-
                 let mut table_rows = Vec::new();
                 
                 for (idx, game) in games.iter().enumerate() {
                     let date_str = game.timestamp.format("%Y-%m-%d %H:%M").to_string();
-                    
                     table_rows.push(vec![
                         (idx + 1).cell().justify(Justify::Right),
                         game.name.clone().cell(),
@@ -299,31 +304,23 @@ async fn main() {
                     ]);
                 }
 
-                let table = table_rows
-                    .table()
-                    .title(vec![
-                        "NO".cell().bold(true),
-                        "İSİM".cell().bold(true),
-                        "OYUN ID (UUID)".cell().bold(true), 
-                        "TARİH".cell().bold(true),
-                    ])
-                    .bold(true);
+                let table = table_rows.table().title(vec![
+                    "NO".cell().bold(true), "İSİM".cell().bold(true),
+                    "OYUN ID (UUID)".cell().bold(true), "TARİH".cell().bold(true),
+                ]).bold(true);
 
                 println!("{}", table.display().unwrap());
                 println!("\n💡 Oynamak için: cargo run -- play <OYUN_ID>"); 
             }
         }
-
         Commands::Listen => {
             println!("👂 P2P Ağı dinleniyor... (Çıkmak için Ctrl+C'ye basın)");
             network::start_listener("fairplay-games").await; 
         }
-
         Commands::Connect { channel } => {
             println!("🔗 Özel kanala kilitleniyor: {}", channel);
             network::start_listener(channel).await;
         }
-
         Commands::Play { id } => {
             let games = crate::registry::load_games();
             let game = games.into_iter().find(|g| g.id == *id).expect("❌ Oyun kayıtlı değil!");
@@ -334,7 +331,6 @@ async fn main() {
                 }
             }
         }
-        
         Commands::Ui => {
             println!("🎨 Fairplay arayüzü başlatılıyor...");
             let options = eframe::NativeOptions {

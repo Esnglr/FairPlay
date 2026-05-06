@@ -185,7 +185,8 @@ pub async fn fetch_game(id: &str, tx: Option<UnboundedSender<AppMessage>>) -> Re
     
     if !response.status().is_success() { return Err("IPFS indirme hatası".into()); }
 
-    let total_size = response.content_length().unwrap_or(1);
+    // DÜZELTME: Boyut bilinmiyorsa (chunked payload) Option olarak bırakıyoruz
+    let total_size = response.content_length(); 
     let mut downloaded: u64 = 0;
     let mut bytes = Vec::new();
 
@@ -194,10 +195,12 @@ pub async fn fetch_game(id: &str, tx: Option<UnboundedSender<AppMessage>>) -> Re
         bytes.extend_from_slice(&chunk);
         
         if let Some(sender) = &tx {
-            let progress = (downloaded as f32) / (total_size as f32);
+            // Boyut belliyse % hesabı yap, değilse -1.0 flag'i gönder (UI spinner gösterecek)
+            let progress = total_size.map(|t| (downloaded as f32) / (t as f32)).unwrap_or(-1.0);
             let _ = sender.send(AppMessage::DownloadProgress { 
                 game_id: id.to_string(), 
-                progress 
+                progress,
+                downloaded // MB gösterimi için ham veriyi de aktarıyoruz
             });
         }
     }
