@@ -25,6 +25,11 @@ enum Commands {
         channel: String,
         #[arg(short, long)]
         executable: Option<String>,
+        #[arg(long)]
+        id: Option<String>,
+        /// YENİ: Oyunu yayından kaldırmak için bayrak
+        #[arg(long, default_value_t = false)]
+        unpublish: bool,
     },
     /// Ağdan duyulan mevcut oyunları listele
     List,
@@ -49,10 +54,10 @@ async fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Publish { name, path, channel, executable } => {
+        Commands::Publish { name, path, channel, executable, id, unpublish } => {
             println!("🚀 İşlem başlatıldı: {} (Yol: {}, Kanal: {})", name, path, channel);
             // channel parametresini fonksiyona iletiyoruz
-            if let Err(e) = network::publish_game(name, path, channel, executable.clone()).await {
+            if let Err(e) = network::publish_game(name, path, channel, executable.clone(), id.clone(), *unpublish).await {
                 eprintln!("Yayınlama başarısız oldu: {}", e);
             }
         }

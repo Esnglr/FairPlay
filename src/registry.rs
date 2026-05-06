@@ -46,12 +46,29 @@ pub fn load_games() -> Vec<Game> {
 }
 
 // Task 3.4 (B): Yeni Oyun Ekleme (Save)
-pub fn save_game(game: Game) {
+pub fn save_game(new_game: Game) {
     let mut games = load_games();
-    games.push(game);
+    
+    // Tombstone Mantığı: Eğer CID "NULL" ise bu bir yayından kaldırma anonsudur
+    if new_game.cid == "NULL" {
+        games.retain(|g| g.id != new_game.id);
+        println!("🗑️  Oyun (ID: {}) yayından kaldırıldığı için listeden silindi.", new_game.id);
+    } else {
+        // Upsert Mantığı: Oyun zaten varsa ve yeni anons daha güncelse verileri yenile
+        if let Some(existing_game) = games.iter_mut().find(|g| g.id == new_game.id) {
+            if new_game.timestamp > existing_game.timestamp {
+                existing_game.cid = new_game.cid;
+                existing_game.name = new_game.name;
+                existing_game.executable = new_game.executable;
+                existing_game.timestamp = new_game.timestamp;
+            }
+        } else {
+            // Oyun sistemde hiç yoksa yeni oyun olarak ekle
+            games.push(new_game);
+        }
+    }
     
     let path = get_registry_path();
-    // JSON'u okunaklı (pretty) formatta kaydet
     let data = serde_json::to_string_pretty(&games).expect("JSON serilestirilemedi");
-    fs::write(path, data).expect("Registry dosyasina yazilamadi");
+    std::fs::write(path, data).expect("Registry dosyasina yazilamadi");
 }

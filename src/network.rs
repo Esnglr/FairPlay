@@ -96,69 +96,72 @@ pub async fn start_listener(topic: &str) {
 }
 
 // Oyun yayınlama fonksiyonu
-pub async fn publish_game(name: &str, file_path: &str, channel: &str, executable: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    println!("📦 Klasör/Dosya IPFS ağına yükleniyor...");
-
-    // ADIM 1 & 2: IPFS CLI kullanarak Klasör/Dosya Ekleme (Recursive)
-    use std::process::{Command, Stdio};
-    use std::io::Write;
+pub async fn publish_game(
+    name: &str, 
+    file_path: &str, 
+    channel: &str, 
+    executable: Option<String>,
+    existing_id: Option<String>, // YENİ
+    unpublish: bool              // YENİ
+) -> Result<(), Box<dyn std::error::Error>> {
     
-    let add_output = Command::new("ipfs")
-        .arg("add")
-        .arg("-r") // Klasörleri içindeki her şeyle birlikte ekle (recursive)
-        .arg("-Q") // Çıktıyı sessize al, SADECE en üst klasörün CID'sini (Hash) ver (Quiet)
-        .arg(file_path)
-        .output()?;
+    let cid;
+    
+    // Eğer unpublish bayrağı verildiyse dosya yükleme, direkt NULL geç!
+    if unpublish {
+        println!("🗑️ Yayından kaldırma anonsu hazırlanıyor...");
+        cid = "NULL".to_string();
+    } else {
+        println!("📦 Klasör/Dosya IPFS ağına yükleniyor...");
+        use std::process::{Command, Stdio};
+        
+        let add_output = Command::new("ipfs")
+            .arg("add").arg("-r").arg("-Q").arg(file_path).output()?;
 
-    if !add_output.status.success() {
-        let err_text = String::from_utf8_lossy(&add_output.stderr);
-        return Err(format!("IPFS Ekleme Hatası: {}", err_text).into());
+        if !add_output.status.success() {
+            return Err(format!("IPFS Ekleme Hatası: {}", String::from_utf8_lossy(&add_output.stderr)).into());
+        }
+        cid = String::from_utf8_lossy(&add_output.stdout).trim().to_string();
+        println!("✅ Dosyalar başarıyla eklendi! Yeni CID: {}", cid);
     }
 
-    // IPFS bize doğrudan ve tertemiz bir şekilde CID döndürüyor
-    let cid = String::from_utf8_lossy(&add_output.stdout).trim().to_string();
-    println!("✅ Dosyalar başarıyla eklendi! Root CID: {}", cid);
+    // ID BELİRLEME: Güncelleme ise var olanı kullan, ilk yükleme ise yeni UUID üret
+    let id = existing_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    // ADIM 3: Oyun objesini (JSON) oluştur
     let game = crate::registry::Game {
-        id: cid.clone(), // Benzersiz ID olarak oyunun kendi Hash'ini kullanıyoruz
+        id: id.clone(),
         name: name.to_string(),
         cid: cid.clone(),
         timestamp: chrono::Utc::now(),
-        executable, // Başlatma argümanı JSON'a ekleniyor
+        executable,
     };
     
-    // Objemizi ağa yollamak üzere String'e çeviriyoruz
     let game_json = serde_json::to_string(&game)?;
 
-    // ADIM 4: PubSub üzerinden ağa duyur
-    println!("📢 Oyun '{}' kanalındaki Peer'lara duyuruluyor...", channel);
-
+    println!("📢 Anons '{}' kanalındaki Peer'lara duyuruluyor...", channel);
+    
+    use std::process::{Command, Stdio};
+    use std::io::Write;
     let mut child = Command::new("ipfs")
-        .arg("pubsub")
-        .arg("pub")
-        .arg(channel) // ARTIK HARDCODED DEĞİL, DİNAMİK PARAMETRE KULLANIYORUZ
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("IPFS CLI komutu başlatılamadı");
+        .arg("pubsub").arg("pub").arg(channel)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn()?;
 
-    // Açtığımız borunun (stdin) içine JSON byte'larımızı yazıyoruz
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(game_json.as_bytes()).expect("JSON verisi STDIN'e yazılamadı");
+        stdin.write_all(game_json.as_bytes())?;
     }
 
-    // Şimdi sürecin bitmesini bekle ve dönen sonucu al
-    let output = child.wait_with_output().expect("IPFS CLI süreci beklenemedi");
+    let output = child.wait_with_output()?;
 
     if output.status.success() {
-        println!("🎉 '{}' isimli oyun başarıyla ağa yayınlandı!", name);
-        // Yerel registry'ye (JSON veritabanımıza) kaydet
+        if unpublish {
+            println!("🎉 '{}' isimli oyunu kaldırma isteği ağa başarıyla iletildi!", name);
+        } else {
+            println!("🎉 '{}' isimli oyunun yeni versiyonu başarıyla ağa yayınlandı! (ID: {})", name, id);
+        }
         crate::registry::save_game(game);
     } else {
-        let err_text = String::from_utf8_lossy(&output.stderr);
-        eprintln!("❌ Ağa duyururken CLI hatası oluştu: {}", err_text);
+        eprintln!("❌ Ağa duyururken CLI hatası oluştu.");
     }
 
     Ok(())
