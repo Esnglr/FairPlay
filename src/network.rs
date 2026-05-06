@@ -13,12 +13,14 @@ pub async fn start_listener(topic: &str) {
     use tokio::process::Command as TokioCommand;
     use std::process::{Command as StdCommand, Stdio};
     use tokio::io::{AsyncBufReadExt, BufReader};
+    use ssh_key::PublicKey;
     use serde_json::json;
 
     let topic_clone = topic.to_string();
 
+    // 1. AĞA İLK KATILIŞTA SENKRONİZASYON İSTEĞİ (SYNC_REQ) FIRLAT
     tokio::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await; // Dinleyicinin tamamen açılmasını bekle
         println!("📡 Ağdaki diğer Peer'lardan güncel oyun listesi isteniyor...");
         let req_payload = json!({"action": "SYNC_REQ"}).to_string() + "\n";
         
@@ -32,6 +34,7 @@ pub async fn start_listener(topic: &str) {
         }
     });
 
+    // 2. ANA DİNLEME DÖNGÜSÜ
     loop {
         println!("🔄 [SİSTEM] IPFS CLI üzerinden frekansa bağlanılıyor...");
         
@@ -57,12 +60,15 @@ pub async fn start_listener(topic: &str) {
                     continue; 
                 }
                 
+                // GELEN HAM JSON'I AYRIŞTIR
                 if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(trimmed) {
                     
+                    // DURUM 1: BİRİSİ AĞA YENİ GİRDİ VE LİSTE İSTİYOR
                     if json_val.get("action").and_then(|v| v.as_str()) == Some("SYNC_REQ") {
                         let mut registry_path = dirs::home_dir().unwrap();
                         registry_path.push(".fairplay"); registry_path.push("registry.json");
 
+                        // Eğer kendi kütüphanemiz boş değilse ona gönderelim
                         if registry_path.exists() && fs::metadata(&registry_path).map(|m| m.len()).unwrap_or(0) > 5 {
                             println!("🤝 Ağdan senkronizasyon isteği geldi. Yerel liste paylaşılıyor...");
                             if let Ok(add_output) = StdCommand::new("ipfs").arg("add").arg("-Q").arg(&registry_path).output() {
@@ -80,6 +86,7 @@ pub async fn start_listener(topic: &str) {
                         continue;
                     }
 
+                    // DURUM 2: AĞDAN GÜNCEL KÜTÜPHANE CEVABI GELDİ
                     if json_val.get("action").and_then(|v| v.as_str()) == Some("SYNC_RES") {
                         if let Some(cid) = json_val.get("cid").and_then(|v| v.as_str()) {
                             println!("📥 Ağdan toplu kütüphane CID'si alındı: {}. İşleniyor...", cid);
@@ -89,6 +96,7 @@ pub async fn start_listener(topic: &str) {
                                 if let Ok(remote_games) = serde_json::from_str::<Vec<crate::registry::Game>>(&downloaded_json) {
                                     let mut added = 0;
                                     for game in remote_games {
+                                        // Zaten var olan veya geçersiz imzalı olanları save_game otomatik filtreler
                                         if crate::registry::save_game(game).is_ok() { 
                                             added += 1; 
                                         }
@@ -105,6 +113,7 @@ pub async fn start_listener(topic: &str) {
                         continue;
                     }
 
+                    // DURUM 3: NORMAL TEKİL OYUN DUYURUSU (Mevcut Mantık)
                     if let Ok(oyun) = serde_json::from_str::<crate::registry::Game>(trimmed) {
                         let cert_payload = format!("{}:{}", oyun.id, oyun.developer_pubkey);
                         let master_key_res = PublicKey::from_openssh(crate::registry::MASTER_PUBKEY);
@@ -214,7 +223,7 @@ pub async fn publish_game(
 
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
-        let _ = stdin.write_all(game_json.as_bytes());
+        stdin.write_all(game_json.as_bytes())?;
     }
 
     let output = child.wait_with_output()?;
@@ -301,6 +310,8 @@ pub fn launch_game(game: &crate::registry::Game) -> Result<(), Box<dyn std::erro
             return Err(format!("Çalıştırılabilir dosya bulunamadı: {}", exec_path).into());
         }
 
+        let work_dir = full_exec_path.parent().unwrap();
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -311,43 +322,11 @@ pub fn launch_game(game: &crate::registry::Game) -> Result<(), Box<dyn std::erro
             }
         }
 
-        // --- DEV ENVIRONMENT BYPASS KONTROLÜ ---
-        let disable_sandbox = std::env::var("FAIRPLAY_NO_BWRAP").unwrap_or_else(|_| "0".to_string()) == "1";
-
-        if disable_sandbox {
-            println!("⚠️ [DEV MODU] Sandbox atlanarak oyun doğrudan başlatılıyor...");
-            
-            let mut child = std::process::Command::new(&full_exec_path)
-                .current_dir(&cache_path) 
-                .spawn()
-                .expect("❌ Oyun doğrudan başlatılamadı!");
-
-            let status = child.wait().expect("Oyun süreci dinlenirken hata oluştu");
-            println!("🏁 Oyun kapatıldı (Çıkış Kodu: {})", status);
-        } else {
-            // --- NORMAL BUBBLEWRAP ÇALIŞMASI ---
-            let relative_exec = full_exec_path.strip_prefix(&cache_path)
-                .expect("Çalıştırılabilir dosya cache dizini dışında olamaz!");
-            
-            let sandbox_exec_path = std::path::Path::new("/app").join(relative_exec);
-
-            println!("🛡️ Bubblewrap sandbox aktif ediliyor...");
-            
-            let mut child = std::process::Command::new("bwrap")
-                .arg("--ro-bind").arg("/").arg("/")                     
-                .arg("--bind").arg(&cache_path).arg("/app")             
-                .arg("--unshare-net")                                   
-                .arg("--unshare-pid")                                   
-                .arg("--unshare-ipc")                                   
-                .arg("--chdir").arg("/app")                             
-                .arg(&sandbox_exec_path)                                
-                .spawn()
-                .expect("❌ Bubblewrap başlatılamadı! Sisteminize 'bwrap' paketinin yüklü olduğundan emin olun.");
-            
-            let status = child.wait().expect("Oyun süreci dinlenirken hata oluştu");
-            println!("🏁 Sandbox kapatıldı (Çıkış Kodu: {})", status);
-        }
+        let mut child = std::process::Command::new(&full_exec_path)
+            .current_dir(work_dir)
+            .spawn()?;
         
+        child.wait()?;
         Ok(())
     } else {
         Err("Bu oyun için otomatik başlatma verisi (executable) tanımlanmamış.".into())
