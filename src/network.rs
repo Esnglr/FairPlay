@@ -10,18 +10,38 @@ use crate::AppMessage;
 pub async fn start_listener(topic: &str) {
     println!("👂 IPFS Pubsub arka planda dinleniyor: {}", topic);
 
-    use tokio::process::Command;
-    use std::process::Stdio;
+    use tokio::process::Command as TokioCommand;
+    use std::process::{Command as StdCommand, Stdio};
     use tokio::io::{AsyncBufReadExt, BufReader};
+    use ssh_key::PublicKey;
+    use serde_json::json;
 
+    let topic_clone = topic.to_string();
+
+    // 1. AĞA İLK KATILIŞTA SENKRONİZASYON İSTEĞİ (SYNC_REQ) FIRLAT
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await; // Dinleyicinin tamamen açılmasını bekle
+        println!("📡 Ağdaki diğer Peer'lardan güncel oyun listesi isteniyor...");
+        let req_payload = json!({"action": "SYNC_REQ"}).to_string() + "\n";
+        
+        let mut child = TokioCommand::new("ipfs")
+            .arg("pubsub").arg("pub").arg(&topic_clone)
+            .stdin(Stdio::piped()).spawn().unwrap();
+            
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(req_payload.as_bytes()).await;
+        }
+    });
+
+    // 2. ANA DİNLEME DÖNGÜSÜ
     loop {
         println!("🔄 [SİSTEM] IPFS CLI üzerinden frekansa bağlanılıyor...");
         
-        // YENİ: tokio::process kullanıldı ve kill_on_drop aktif edildi!
-        let mut child = Command::new("ipfs")
+        let mut child = TokioCommand::new("ipfs")
             .arg("pubsub").arg("sub").arg(topic)
             .stdout(Stdio::piped())
-            .kill_on_drop(true) // Görev sonlanırsa process de ölür (Zombi bırakmaz)
+            .kill_on_drop(true) 
             .spawn()
             .expect("❌ IPFS CLI başlatılamadı");
 
@@ -31,9 +51,8 @@ pub async fn start_listener(topic: &str) {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
             
-            // YENİ: Asenkron Non-blocking IO Okuma
             while let Ok(bytes_read) = reader.read_line(&mut line).await {
-                if bytes_read == 0 { break; } // Process kapandı (EOF)
+                if bytes_read == 0 { break; } 
                 
                 let trimmed = line.trim();
                 if trimmed.is_empty() { 
@@ -41,48 +60,93 @@ pub async fn start_listener(topic: &str) {
                     continue; 
                 }
                 
-                if let Ok(oyun) = serde_json::from_str::<crate::registry::Game>(trimmed) {
-                    let cert_payload = format!("{}:{}", oyun.id, oyun.developer_pubkey);
-                    let master_key_res = PublicKey::from_openssh(crate::registry::MASTER_PUBKEY);
+                // GELEN HAM JSON'I AYRIŞTIR
+                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(trimmed) {
                     
-                    if let Ok(master_key) = master_key_res {
-                        if let Ok(platform_sig) = oyun.platform_certificate.parse::<ssh_key::SshSig>() {
-                            if master_key.verify("fairplay-namespace", cert_payload.as_bytes(), &platform_sig).is_err() {
-                                eprintln!("\n🚨 [REDDEDİLDİ] '{}' için sahte geliştirici anahtarı tespit edildi!", oyun.name);
-                                line.clear();
-                                continue;
+                    // DURUM 1: BİRİSİ AĞA YENİ GİRDİ VE LİSTE İSTİYOR
+                    if json_val.get("action").and_then(|v| v.as_str()) == Some("SYNC_REQ") {
+                        let mut registry_path = dirs::home_dir().unwrap();
+                        registry_path.push(".fairplay"); registry_path.push("registry.json");
+
+                        // Eğer kendi kütüphanemiz boş değilse ona gönderelim
+                        if registry_path.exists() && fs::metadata(&registry_path).map(|m| m.len()).unwrap_or(0) > 5 {
+                            println!("🤝 Ağdan senkronizasyon isteği geldi. Yerel liste paylaşılıyor...");
+                            if let Ok(add_output) = StdCommand::new("ipfs").arg("add").arg("-Q").arg(&registry_path).output() {
+                                let cid = String::from_utf8_lossy(&add_output.stdout).trim().to_string();
+                                let res_payload = json!({"action": "SYNC_RES", "cid": cid}).to_string() + "\n";
+
+                                let mut pub_child = StdCommand::new("ipfs").arg("pubsub").arg("pub").arg(topic).stdin(Stdio::piped()).spawn().unwrap();
+                                if let Some(mut stdin) = pub_child.stdin.take() {
+                                    use std::io::Write;
+                                    let _ = stdin.write_all(res_payload.as_bytes());
+                                }
                             }
-                        } else {
-                            eprintln!("\n🚨 [REDDEDİLDİ] '{}' oyununun sertifika formatı bozuk!", oyun.name);
-                            line.clear();
-                            continue;
                         }
-                    } else {
-                        eprintln!("\n⚠️ [SİSTEM HATASI] MASTER_PUBKEY geçersiz!");
                         line.clear();
                         continue;
                     }
 
-                    let payload_to_verify = format!("{}:{}:{}:{}", oyun.id, oyun.name, oyun.cid, oyun.version);
-                    
-                    let is_valid = PublicKey::from_openssh(&oyun.developer_pubkey)
-                        .and_then(|pub_key| {
-                            let signature = oyun.signature.parse::<ssh_key::SshSig>().map_err(|_| ssh_key::Error::Crypto)?;
-                            pub_key.verify("fairplay-namespace", payload_to_verify.as_bytes(), &signature)
-                        });
-
-                    if is_valid.is_ok() {
-                        println!("\n🔐 [GÜVENLİ] Sertifika ve İmza doğrulandı! Geliştirici yetkili.");
-                        if let Err(e) = crate::registry::save_game(oyun.clone()) {
-                            eprintln!("❌ Kayıt Hatası: {}", e);
-                        } else {
-                            println!("🎉 [BAŞARI] OYUN AĞDAN ALINDI: {} (v{})", oyun.name, oyun.version);
+                    // DURUM 2: AĞDAN GÜNCEL KÜTÜPHANE CEVABI GELDİ
+                    if json_val.get("action").and_then(|v| v.as_str()) == Some("SYNC_RES") {
+                        if let Some(cid) = json_val.get("cid").and_then(|v| v.as_str()) {
+                            println!("📥 Ağdan toplu kütüphane CID'si alındı: {}. İşleniyor...", cid);
+                            if let Ok(cat_output) = StdCommand::new("ipfs").arg("cat").arg(cid).output() {
+                                let downloaded_json = String::from_utf8_lossy(&cat_output.stdout);
+                                
+                                if let Ok(remote_games) = serde_json::from_str::<Vec<crate::registry::Game>>(&downloaded_json) {
+                                    let mut added = 0;
+                                    for game in remote_games {
+                                        // Zaten var olan veya geçersiz imzalı olanları save_game otomatik filtreler
+                                        if crate::registry::save_game(game).is_ok() { 
+                                            added += 1; 
+                                        }
+                                    }
+                                    if added > 0 {
+                                        println!("✅ Stateful Sync tamamlandı! {} yeni/güncel oyun eklendi.", added);
+                                    } else {
+                                        println!("⚡ Gelen liste zaten mevcut kütüphane ile aynı. Ekstra işlem yapılmadı.");
+                                    }
+                                }
+                            }
                         }
-                    } else {
-                        eprintln!("\n🚨 [TEHLİKE] {} adlı oyunun içeriği değiştirilmiş! (İmza Geçersiz)", oyun.name);
+                        line.clear();
+                        continue;
+                    }
+
+                    // DURUM 3: NORMAL TEKİL OYUN DUYURUSU (Mevcut Mantık)
+                    if let Ok(oyun) = serde_json::from_str::<crate::registry::Game>(trimmed) {
+                        let cert_payload = format!("{}:{}", oyun.id, oyun.developer_pubkey);
+                        let master_key_res = PublicKey::from_openssh(crate::registry::MASTER_PUBKEY);
+                        
+                        if let Ok(master_key) = master_key_res {
+                            if let Ok(platform_sig) = oyun.platform_certificate.parse::<ssh_key::SshSig>() {
+                                if master_key.verify("fairplay-namespace", cert_payload.as_bytes(), &platform_sig).is_err() {
+                                    eprintln!("\n🚨 [REDDEDİLDİ] '{}' için sahte geliştirici anahtarı tespit edildi!", oyun.name);
+                                    line.clear(); continue;
+                                }
+                            } else {
+                                line.clear(); continue;
+                            }
+                        }
+
+                        let payload_to_verify = format!("{}:{}:{}:{}", oyun.id, oyun.name, oyun.cid, oyun.version);
+                        let is_valid = PublicKey::from_openssh(&oyun.developer_pubkey)
+                            .and_then(|pub_key| {
+                                let signature = oyun.signature.parse::<ssh_key::SshSig>().map_err(|_| ssh_key::Error::Crypto)?;
+                                pub_key.verify("fairplay-namespace", payload_to_verify.as_bytes(), &signature)
+                            });
+
+                        if is_valid.is_ok() {
+                            println!("\n🔐 [GÜVENLİ] İmza doğrulandı!");
+                            if let Err(e) = crate::registry::save_game(oyun.clone()) {
+                                eprintln!("❌ Kayıt Hatası: {}", e);
+                            } else {
+                                println!("🎉 [BAŞARI] YENİ OYUN DUYULDU: {} (v{})", oyun.name, oyun.version);
+                            }
+                        }
                     }
                 }
-                line.clear(); // Buffer'ı temizle
+                line.clear(); 
             }
         }
         
